@@ -218,7 +218,7 @@ struct State<E: iced_core::text::editor::Editor> {
     editor: E,
     content: String,
     is_focused: bool,
-    is_dragging: bool,
+    drag_click: Option<mouse::click::Kind>,
     last_click: Option<mouse::Click>,
     keyboard_modifiers: keyboard::Modifiers,
     menu: context_menu::State,
@@ -230,7 +230,7 @@ impl<E: iced_core::text::editor::Editor> Default for State<E> {
             editor: E::default(),
             content: String::new(),
             is_focused: false,
-            is_dragging: false,
+            drag_click: None,
             last_click: None,
             keyboard_modifiers: keyboard::Modifiers::default(),
             menu: context_menu::State::new(),
@@ -251,22 +251,28 @@ enum Interaction {
     Release,
 }
 
+/// Normalizes a pointer event into an [`Interaction`].
+///
+/// The cursor is always used instead of the raw position carried by the event,
+/// because ancestors—like a [`Scrollable`](iced_widget::scrollable)—translate
+/// the cursor into the coordinate space of their content, while the event keeps
+/// reporting window coordinates. Both `bounds` and the editor live in that
+/// content space, so the translated cursor is the only position that agrees
+/// with them.
 fn interaction(event: &Event, cursor: mouse::Cursor) -> Option<Interaction> {
     match event {
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
             cursor.position().map(Interaction::Press)
         }
-        Event::Mouse(mouse::Event::CursorMoved { position }) => {
-            Some(Interaction::Move(*position))
+        Event::Mouse(mouse::Event::CursorMoved { .. })
+        | Event::Touch(touch::Event::FingerMoved { .. }) => {
+            cursor.position().map(Interaction::Move)
         }
         Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
             Some(Interaction::Release)
         }
-        Event::Touch(touch::Event::FingerPressed { position, .. }) => {
-            Some(Interaction::Press(*position))
-        }
-        Event::Touch(touch::Event::FingerMoved { position, .. }) => {
-            Some(Interaction::Move(*position))
+        Event::Touch(touch::Event::FingerPressed { .. }) => {
+            cursor.position().map(Interaction::Press)
         }
         Event::Touch(
             touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. },
@@ -383,7 +389,7 @@ where
                     // Clicking anywhere else takes the focus away, but keeps the
                     // selection around—just like a browser does.
                     state.is_focused = false;
-                    state.is_dragging = false;
+                    state.drag_click = None;
 
                     return;
                 }
@@ -398,7 +404,7 @@ where
 
                 state.last_click = Some(click);
                 state.is_focused = true;
-                state.is_dragging = true;
+                state.drag_click = Some(click.kind());
                 state.menu.close();
 
                 state.editor.perform(match click.kind() {
@@ -411,7 +417,12 @@ where
                 shell.request_redraw();
             }
             Some(Interaction::Move(position)) => {
-                if state.is_dragging {
+                // Only a single click starts a drag. A double click selects a
+                // word and a triple click a line; letting the tiny movements
+                // that happen between the clicks of a multi-click drag would
+                // collapse that selection back into a plain caret, which is
+                // exactly what makes word selection feel broken.
+                if state.drag_click == Some(mouse::click::Kind::Single) {
                     state
                         .editor
                         .perform(Action::Drag(local(position, text_bounds)));
@@ -421,7 +432,7 @@ where
                 }
             }
             Some(Interaction::Release) => {
-                state.is_dragging = false;
+                state.drag_click = None;
             }
             None => match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -529,7 +540,7 @@ where
         _layout: Layout<'b>,
         renderer: &Renderer,
         _viewport: &Rectangle,
-        _translation: Vector,
+        translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let state = tree.state.downcast_mut::<State<Renderer::Editor>>();
 
@@ -538,6 +549,7 @@ where
         let State { editor, menu, .. } = state;
 
         let mut menu = Menu::new(menu, &self.entries)
+            .translation(translation)
             .font(self.font.unwrap_or_else(|| renderer.default_font()))
             .text_size(self.size.unwrap_or_else(|| renderer.default_size()))
             .on_dispatch(

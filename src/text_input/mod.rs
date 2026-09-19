@@ -452,7 +452,7 @@ where
         layout: Layout<'b>,
         renderer: &Renderer,
         viewport: &Rectangle,
-        _translation: Vector,
+        translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let state = tree.state.downcast_mut::<State>();
 
@@ -469,6 +469,7 @@ where
         };
 
         let mut menu = Menu::new(&mut state.menu, &self.entries)
+            .translation(translation)
             .font(self.font.unwrap_or_else(|| renderer.default_font()))
             .text_size(
                 self.text_size.unwrap_or_else(|| renderer.default_size()),

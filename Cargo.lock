@@ -1022,7 +1022,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "iced-component"
+name = "iced_component"
 version = "0.1.2"
 dependencies = [
  "bytemuck",

@@ -211,6 +211,7 @@ where
     font: Option<Renderer::Font>,
     text_size: Option<Pixels>,
     class: Option<&'b Theme::Class<'a>>,
+    translation: Vector,
 }
 
 impl<'a, 'b, Message, Theme, Renderer> Menu<'a, 'b, Message, Theme, Renderer>
@@ -232,7 +233,22 @@ where
             font: None,
             text_size: None,
             class: None,
+            translation: Vector::ZERO,
         }
+    }
+
+    /// Offsets the menu from the coordinate space its position was recorded in
+    /// to the coordinate space of the window.
+    ///
+    /// Ancestors that translate their contents—like a
+    /// [`Scrollable`](iced_widget::scrollable)—hand their translation down to
+    /// [`overlay`](Widget::overlay), while the position a widget records when
+    /// it opens a menu is expressed in their content space. A menu that does
+    /// not apply the translation would therefore be drawn as if the contents
+    /// had never been scrolled.
+    pub fn translation(mut self, translation: Vector) -> Self {
+        self.translation = translation;
+        self
     }
 
     /// Sets the callback used to handle [`Entry::dispatch`] entries.
@@ -372,8 +388,11 @@ where
         let size = self.size(renderer);
         let viewport = Rectangle::with_size(bounds);
 
-        let mut x = self.state.position().map_or(0.0, |position| position.x);
-        let mut y = self.state.position().map_or(0.0, |position| position.y);
+        let position =
+            self.state.position().unwrap_or(Point::ORIGIN) + self.translation;
+
+        let mut x = position.x;
+        let mut y = position.y;
 
         if x + size.width > viewport.x + viewport.width {
             x = viewport.x + viewport.width - size.width;
@@ -783,7 +802,7 @@ where
         _layout: Layout<'b>,
         renderer: &Renderer,
         _viewport: &Rectangle,
-        _translation: Vector,
+        translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let state = tree.state.downcast_mut::<State>();
 
@@ -792,6 +811,7 @@ where
         }
 
         let mut menu = Menu::new(state, &self.entries)
+            .translation(translation)
             .font(self.font.unwrap_or_else(|| renderer.default_font()))
             .text_size(
                 self.text_size.unwrap_or_else(|| renderer.default_size()),
