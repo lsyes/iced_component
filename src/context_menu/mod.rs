@@ -38,29 +38,34 @@
 
 use std::borrow::Cow;
 
-use iced_core::clipboard::Clipboard;
 use iced_core::keyboard;
 use iced_core::mouse;
 use iced_core::text;
 use iced_core::widget::tree::{self, Tree};
 use iced_core::window;
 use iced_core::{
-    Background, Border, Color, Element, Event, Layout, Length, Pixels, Point,
-    Rectangle, Shadow, Shell, Size, Vector, Widget, alignment, layout, overlay,
-    renderer,
+    Background, Border, Color, Element, Event, Font, Layout, Length, Pixels,
+    Point, Rectangle, Shadow, Shell, Size, Vector, Widget, alignment, layout,
+    overlay, renderer,
 };
 
 /// The spacing between the border of a menu and its entries.
-pub const PADDING: f32 = 4.0;
+pub const PADDING: f32 = 6.0;
 
 /// The height of a single menu entry.
-pub const ITEM_HEIGHT: f32 = 28.0;
+pub const ITEM_HEIGHT: f32 = 34.0;
 
 /// The horizontal padding inside a menu entry.
-pub const ITEM_PADDING_X: f32 = 12.0;
+pub const ITEM_PADDING_X: f32 = 16.0;
 
 /// The minimum width of a menu.
-pub const MIN_WIDTH: f32 = 140.0;
+pub const MIN_WIDTH: f32 = 180.0;
+
+/// The corner radius of a menu.
+pub const BORDER_RADIUS: f32 = 12.0;
+
+/// The corner radius of a hovered entry.
+pub const ITEM_BORDER_RADIUS: f32 = 8.0;
 
 /// Roughly how wide a character is, relative to the text size. Used to guess
 /// the width of a menu from its longest entry.
@@ -173,12 +178,11 @@ impl<'a, Message> Entry<'a, Message> {
 
 /// The callback that handles the [`Entry::dispatch`] entries of a [`Menu`].
 ///
-/// It receives the index of the chosen entry, the [`Renderer`] of the runtime
-/// and the [`Clipboard`].
-pub type Dispatcher<'a, Message, Renderer> = Box<
-    dyn FnMut(usize, &Renderer, &mut dyn Clipboard, &mut Shell<'_, Message>)
-        + 'a,
->;
+/// It receives the index of the chosen entry and the [`Shell`] of the runtime,
+/// which is everything a widget needs to carry out the action—publishing a
+/// message, reading or writing the clipboard, or requesting a redraw.
+pub type Dispatcher<'a, Message> =
+    Box<dyn FnMut(usize, &mut Shell<'_, Message>) + 'a>;
 
 /// The overlay that draws and drives a context menu.
 ///
@@ -189,6 +193,8 @@ pub type Dispatcher<'a, Message, Renderer> = Box<
 /// # fn build<'a, 'b, Message, Theme, Renderer>(
 /// #     state: &'b mut State,
 /// #     entries: &'b [Entry<'a, Message>],
+/// #     renderer: &Renderer,
+/// #     window: iced_core::Size,
 /// # ) -> iced_core::overlay::Element<'b, Message, Theme, Renderer>
 /// # where
 /// #     Message: 'b,
@@ -196,32 +202,30 @@ pub type Dispatcher<'a, Message, Renderer> = Box<
 /// #     Renderer: iced_core::text::Renderer + 'b,
 /// # {
 /// Menu::new(state, entries)
-///     .on_dispatch(|index, _renderer, _clipboard, _shell| { /* ... */ })
-///     .overlay()
+///     .on_dispatch(|index, _shell| { /* ... */ })
+///     .overlay(renderer, window)
 /// # }
 /// ```
-pub struct Menu<'a, 'b, Message, Theme, Renderer>
+pub struct Menu<'a, 'b, Message, Theme>
 where
     Theme: Catalog,
-    Renderer: text::Renderer,
 {
     state: &'b mut State,
     entries: &'b [Entry<'a, Message>],
-    dispatch: Option<Dispatcher<'b, Message, Renderer>>,
-    font: Option<Renderer::Font>,
+    dispatch: Option<Dispatcher<'b, Message>>,
+    font: Option<Font>,
     text_size: Option<Pixels>,
     class: Option<&'b Theme::Class<'a>>,
     translation: Vector,
 }
 
-impl<'a, 'b, Message, Theme, Renderer> Menu<'a, 'b, Message, Theme, Renderer>
+impl<'a, 'b, Message, Theme> Menu<'a, 'b, Message, Theme>
 where
     Theme: Catalog,
-    Renderer: text::Renderer,
 {
     /// Creates a [`Menu`] for the given [`State`] and entries.
     ///
-    /// The font and the text size default to the ones of the [`Renderer`].
+    /// The font and the text size default to the ones of the [`Renderer`](iced_core::text::Renderer).
     pub fn new(
         state: &'b mut State,
         entries: &'b [Entry<'a, Message>],
@@ -241,7 +245,7 @@ where
     /// to the coordinate space of the window.
     ///
     /// Ancestors that translate their contents—like a
-    /// [`Scrollable`](iced_widget::scrollable)—hand their translation down to
+    /// [`Scrollable`](iced_widget::scrollable::Scrollable)—hand their translation down to
     /// [`overlay`](Widget::overlay), while the position a widget records when
     /// it opens a menu is expressed in their content space. A menu that does
     /// not apply the translation would therefore be drawn as if the contents
@@ -253,25 +257,19 @@ where
 
     /// Sets the callback used to handle [`Entry::dispatch`] entries.
     ///
-    /// It receives the index of the entry that was chosen, the [`Renderer`] of
-    /// the runtime and the [`Clipboard`]—everything a widget may need to carry
-    /// out the action itself.
+    /// It receives the index of the entry that was chosen and the [`Shell`] of
+    /// the runtime—everything a widget may need to carry out the action itself.
     pub fn on_dispatch(
         mut self,
-        dispatch: impl FnMut(
-            usize,
-            &Renderer,
-            &mut dyn Clipboard,
-            &mut Shell<'_, Message>,
-        ) + 'b,
+        dispatch: impl FnMut(usize, &mut Shell<'_, Message>) + 'b,
     ) -> Self {
         self.dispatch = Some(Box::new(dispatch));
         self
     }
 
     /// Sets the font of the menu.
-    pub fn font(mut self, font: Renderer::Font) -> Self {
-        self.font = Some(font);
+    pub fn font(mut self, font: impl Into<Font>) -> Self {
+        self.font = Some(font.into());
         self
     }
 
@@ -287,19 +285,38 @@ where
         self
     }
 
-    /// Turns the [`Menu`] into an [`overlay::Element`].
-    pub fn overlay(self) -> overlay::Element<'b, Message, Theme, Renderer>
+    /// Lays the [`Menu`] out inside the given `window` and turns it into an
+    /// [`overlay::Element`].
+    ///
+    /// The window size is needed to keep the menu inside the screen, no matter
+    /// where it was opened. Overlays are rebuilt on every frame, so the menu
+    /// follows the window as it is resized.
+    pub fn overlay<R>(
+        self,
+        renderer: &R,
+        window: Size,
+    ) -> overlay::Element<'b, Message, Theme, R>
     where
         Message: 'b,
         Theme: 'b,
-        Renderer: 'b,
+        R: text::Renderer + 'b,
     {
-        overlay::Element::new(Box::new(self))
+        let layout = self.layout(renderer, window);
+
+        overlay::Element::new(Box::new(Overlay {
+            state: self.state,
+            entries: self.entries,
+            dispatch: self.dispatch,
+            font: self.font.unwrap_or_else(|| renderer.font()),
+            text_size: self.text_size.unwrap_or_else(|| renderer.text_size()),
+            class: self.class,
+            layout,
+            window,
+        }))
     }
 
-    fn size(&self, renderer: &Renderer) -> Size {
-        let text_size =
-            self.text_size.unwrap_or_else(|| renderer.default_size());
+    fn size<R: text::Renderer>(&self, renderer: &R) -> Size {
+        let text_size = self.text_size.unwrap_or_else(|| renderer.text_size());
         let longest = self
             .entries
             .iter()
@@ -317,6 +334,31 @@ where
         Size::new(width, height)
     }
 
+    /// The layout of the menu, clamped to the window it is opened in.
+    fn layout<R: text::Renderer>(&self, renderer: &R, window: Size) -> Layout {
+        let size = self.size(renderer);
+        let viewport = Rectangle::with_size(window);
+
+        let position =
+            self.state.position().unwrap_or(Point::ORIGIN) + self.translation;
+
+        let mut x = position.x;
+        let mut y = position.y;
+
+        if x + size.width > viewport.x + viewport.width {
+            x = viewport.x + viewport.width - size.width;
+        }
+
+        if y + size.height > viewport.y + viewport.height {
+            y = viewport.y + viewport.height - size.height;
+        }
+
+        x = x.max(viewport.x);
+        y = y.max(viewport.y);
+
+        Layout::new(size).move_to(Point::new(x, y))
+    }
+
     /// The bounds of the entry at the given index, in window coordinates.
     pub fn entry_bounds(&self, bounds: Rectangle, index: usize) -> Rectangle {
         Rectangle {
@@ -326,8 +368,42 @@ where
             height: ITEM_HEIGHT,
         }
     }
+}
 
-    fn entry_at(&self, bounds: Rectangle, position: Point) -> Option<usize> {
+/// The state and behaviour of an open menu, kept alive for as long as the
+/// overlay is drawn.
+struct Overlay<'a, 'b, Message, Theme>
+where
+    Theme: Catalog,
+{
+    state: &'b mut State,
+    entries: &'b [Entry<'a, Message>],
+    dispatch: Option<Dispatcher<'b, Message>>,
+    font: Font,
+    text_size: Pixels,
+    class: Option<&'b Theme::Class<'a>>,
+    layout: Layout,
+    window: Size,
+}
+
+impl<Message, Theme> Overlay<'_, '_, Message, Theme>
+where
+    Theme: Catalog,
+{
+    fn entry_bounds(&self, index: usize) -> Rectangle {
+        let bounds = self.layout.bounds();
+
+        Rectangle {
+            x: bounds.x + PADDING,
+            y: bounds.y + PADDING + index as f32 * ITEM_HEIGHT,
+            width: bounds.width - PADDING * 2.0,
+            height: ITEM_HEIGHT,
+        }
+    }
+
+    fn entry_at(&self, position: Point) -> Option<usize> {
+        let bounds = self.layout.bounds();
+
         if !bounds.contains(position) {
             return None;
         }
@@ -350,13 +426,7 @@ where
         }
     }
 
-    fn choose(
-        &mut self,
-        index: usize,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Message>,
-    ) {
+    fn choose(&mut self, index: usize, shell: &mut Shell<'_, Message>) {
         self.state.close();
 
         let Some(entry) = self.entries.get(index) else {
@@ -371,7 +441,7 @@ where
             Action::Message(on_select) => shell.publish(on_select()),
             Action::Dispatch => {
                 if let Some(dispatch) = self.dispatch.as_mut() {
-                    dispatch(index, renderer, clipboard, shell);
+                    dispatch(index, shell);
                 }
             }
         }
@@ -379,41 +449,16 @@ where
 }
 
 impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
-    for Menu<'_, '_, Message, Theme, Renderer>
+    for Overlay<'_, '_, Message, Theme>
 where
     Theme: Catalog,
     Renderer: text::Renderer,
 {
-    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
-        let size = self.size(renderer);
-        let viewport = Rectangle::with_size(bounds);
-
-        let position =
-            self.state.position().unwrap_or(Point::ORIGIN) + self.translation;
-
-        let mut x = position.x;
-        let mut y = position.y;
-
-        if x + size.width > viewport.x + viewport.width {
-            x = viewport.x + viewport.width - size.width;
-        }
-
-        if y + size.height > viewport.y + viewport.height {
-            y = viewport.y + viewport.height - size.height;
-        }
-
-        x = x.max(viewport.x);
-        y = y.max(viewport.y);
-
-        layout::Node::new(size).translate(Vector::new(x, y))
-    }
-
     fn draw(
         &self,
         renderer: &mut Renderer,
         theme: &Theme,
         _style: &renderer::Style,
-        layout: Layout<'_>,
         _cursor: mouse::Cursor,
     ) {
         if !self.state.is_open() {
@@ -421,83 +466,85 @@ where
         }
 
         let style = self.style(theme);
-        let bounds = layout.bounds();
-        let font = self.font.unwrap_or_else(|| renderer.default_font());
-        let text_size =
-            self.text_size.unwrap_or_else(|| renderer.default_size());
+        let bounds = self.layout.bounds();
 
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds,
-                border: style.border,
-                shadow: style.shadow,
-                ..renderer::Quad::default()
-            },
-            style.background,
-        );
+        // The layer spans the whole window: clipping it to the menu would draw
+        // away the very shadow that lifts the menu off the content.
+        renderer.with_layer(Rectangle::with_size(self.window), |renderer| {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds,
+                    border: style.border,
+                    shadow: style.shadow,
+                    ..renderer::Quad::default()
+                },
+                style.background,
+            );
 
-        for (index, entry) in self.entries.iter().enumerate() {
-            let item = self.entry_bounds(bounds, index);
-            let hovered = self.state.hovered() == Some(index);
+            for (index, entry) in self.entries.iter().enumerate() {
+                let item = self.entry_bounds(index);
+                let hovered = self.state.hovered() == Some(index);
 
-            let (background, text_color) = if !entry.is_enabled() {
-                (None, style.disabled_text_color)
-            } else if hovered {
-                (Some(style.selected_background), style.selected_text_color)
-            } else {
-                (None, style.text_color)
-            };
+                let (background, text_color) = if !entry.is_enabled() {
+                    (None, style.disabled_text_color)
+                } else if hovered {
+                    (Some(style.selected_background), style.selected_text_color)
+                } else {
+                    (None, style.text_color)
+                };
 
-            if let Some(background) = background {
-                renderer.fill_quad(
-                    renderer::Quad {
-                        bounds: item,
-                        ..renderer::Quad::default()
+                if let Some(background) = background {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: item,
+                            border: style.selected_border,
+                            ..renderer::Quad::default()
+                        },
+                        background,
+                    );
+                }
+
+                // `fill_text` anchors the text on the point described by the
+                // alignments, so a vertically centered label is anchored on the
+                // center of its entry.
+                renderer.fill_text(
+                    text::Text {
+                        content: String::from(entry.label()),
+                        bounds: Size::new(f32::INFINITY, item.height),
+                        size: self.text_size,
+                        line_height: text::LineHeight::default(),
+                        font: self.font,
+                        align_x: text::Alignment::Left,
+                        align_y: alignment::Vertical::Center,
+                        shaping: text::Shaping::default(),
+                        wrapping: text::Wrapping::None,
+                        ellipsis: text::Ellipsis::None,
+                        hint_factor: renderer.hint_factor(),
                     },
-                    background,
+                    Point::new(item.x + ITEM_PADDING_X, item.center_y()),
+                    text_color,
+                    bounds,
                 );
             }
-
-            // `fill_text` anchors the text on the point described by the
-            // alignments, so a vertically centered label is anchored on the
-            // center of its entry.
-            renderer.fill_text(
-                text::Text {
-                    content: String::from(entry.label()),
-                    bounds: Size::new(f32::INFINITY, item.height),
-                    size: text_size,
-                    line_height: text::LineHeight::default(),
-                    font,
-                    align_x: text::Alignment::Left,
-                    align_y: alignment::Vertical::Center,
-                    shaping: text::Shaping::default(),
-                    wrapping: text::Wrapping::None,
-                },
-                Point::new(item.x + ITEM_PADDING_X, item.center_y()),
-                text_color,
-                bounds,
-            );
-        }
+        });
     }
 
     fn update(
         &mut self,
         event: &Event,
-        layout: Layout<'_>,
         cursor: mouse::Cursor,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
+        _renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
     ) {
         if !self.state.is_open() {
             return;
         }
 
-        let bounds = layout.bounds();
+        let bounds = self.layout.bounds();
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                let hovered = self.entry_at(bounds, *position);
+                let hovered = self.entry_at(*position);
 
                 if let Some(open) = self.state.open.as_mut()
                     && open.hovered != hovered
@@ -519,15 +566,15 @@ where
                     return;
                 }
 
-                let Some(index) = self.entry_at(bounds, position) else {
+                let Some(index) = self.entry_at(position) else {
                     // A click on the menu padding should not fall through.
                     shell.capture_event();
                     return;
                 };
 
                 shell.request_redraw();
-                self.choose(index, renderer, clipboard, shell);
                 shell.capture_event();
+                self.choose(index, shell);
             }
             Event::Mouse(mouse::Event::ButtonPressed(_)) => {
                 // Another button (typically a second right-click) should reopen
@@ -549,15 +596,12 @@ where
 
     fn mouse_interaction(
         &self,
-        layout: Layout<'_>,
         cursor: mouse::Cursor,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        let bounds = layout.bounds();
-
         cursor
             .position()
-            .and_then(|position| self.entry_at(bounds, position))
+            .and_then(|position| self.entry_at(position))
             .map(|index| {
                 if self.entries[index].is_enabled() {
                     mouse::Interaction::Pointer
@@ -569,39 +613,38 @@ where
             })
             .unwrap_or_default()
     }
+
+    fn index(&self) -> f32 {
+        // A menu is a transient, top-most surface: it must be drawn above every
+        // other overlay—tooltips, pick lists, popovers or floating widgets—that
+        // happens to be open at the same time.
+        f32::MAX
+    }
 }
 
 /// A widget that opens a context menu when it is right-clicked.
 ///
 /// Create it with [`context_menu`] and fill it with [`Entry`] values.
-pub struct ContextMenu<
-    'a,
-    Message,
-    Theme = iced_widget::Theme,
-    Renderer = iced_widget::Renderer,
-> where
+pub struct ContextMenu<'a, W, Message, Theme = iced_widget::Theme>
+where
     Theme: Catalog,
-    Renderer: text::Renderer,
 {
-    content: Element<'a, Message, Theme, Renderer>,
+    content: W,
     entries: Vec<Entry<'a, Message>>,
     context_menu: bool,
-    font: Option<Renderer::Font>,
+    font: Option<Font>,
     text_size: Option<Pixels>,
     class: Option<Theme::Class<'a>>,
 }
 
-impl<'a, Message, Theme, Renderer> ContextMenu<'a, Message, Theme, Renderer>
+impl<'a, W, Message, Theme> ContextMenu<'a, W, Message, Theme>
 where
     Theme: Catalog,
-    Renderer: text::Renderer,
 {
     /// Creates a new [`ContextMenu`] with the given content.
-    pub fn new(
-        content: impl Into<Element<'a, Message, Theme, Renderer>>,
-    ) -> Self {
+    pub fn new(content: W) -> Self {
         Self {
-            content: content.into(),
+            content,
             entries: Vec::new(),
             context_menu: true,
             font: None,
@@ -632,8 +675,8 @@ where
     }
 
     /// Sets the font of the menu.
-    pub fn font(mut self, font: Renderer::Font) -> Self {
-        self.font = Some(font);
+    pub fn font(mut self, font: impl Into<Font>) -> Self {
+        self.font = Some(font.into());
         self
     }
 
@@ -655,21 +698,28 @@ where
 }
 
 /// Creates a widget that opens a context menu when it is right-clicked.
-pub fn context_menu<'a, Message, Theme, Renderer>(
-    content: impl Into<Element<'a, Message, Theme, Renderer>>,
-) -> ContextMenu<'a, Message, Theme, Renderer>
+pub fn context_menu<'a, W, Message, Theme>(
+    content: W,
+) -> ContextMenu<'a, W, Message, Theme>
 where
     Theme: Catalog,
-    Renderer: text::Renderer,
 {
     ContextMenu::new(content)
 }
 
-impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
-    for ContextMenu<'_, Message, Theme, Renderer>
+impl<W, Message, Theme> iced_core::widget::Meta
+    for ContextMenu<'_, W, Message, Theme>
+where
+    Theme: Catalog,
+{
+}
+
+impl<W, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for ContextMenu<'_, W, Message, Theme>
 where
     Theme: Catalog,
     Renderer: text::Renderer,
+    W: Widget<Message, Theme, Renderer>,
 {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
@@ -679,16 +729,12 @@ where
         tree::State::new(State::default())
     }
 
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.content)]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        tree.diff_children(std::slice::from_ref(&self.content));
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
     }
 
     fn size(&self) -> Size<Length> {
-        self.content.as_widget().size()
+        self.content.size()
     }
 
     fn layout(
@@ -696,24 +742,25 @@ where
         tree: &mut Tree,
         renderer: &Renderer,
         limits: &layout::Limits,
-    ) -> layout::Node {
-        self.content.as_widget_mut().layout(
-            &mut tree.children[0],
-            renderer,
-            limits,
-        )
+    ) {
+        self.content.layout(&mut tree.children[0], renderer, limits);
+
+        tree.size = tree.children[0].size;
+        tree.children[0].translation = Vector::ZERO;
     }
 
     fn operate(
         &mut self,
         tree: &mut Tree,
-        layout: Layout<'_>,
+        layout: Layout,
+        viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn iced_core::widget::Operation,
     ) {
-        self.content.as_widget_mut().operate(
+        self.content.operate(
             &mut tree.children[0],
             layout,
+            viewport,
             renderer,
             operation,
         );
@@ -724,10 +771,9 @@ where
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
@@ -736,23 +782,24 @@ where
             && let Event::Mouse(mouse::Event::ButtonPressed(
                 mouse::Button::Right,
             )) = event
-            && let Some(position) = cursor.position_over(layout.bounds())
+            && let Some(position) =
+                cursor.observe().position_over(layout.bounds())
         {
             tree.state.downcast_mut::<State>().open(position);
 
             shell.capture_event();
             shell.request_redraw();
+            shell.invalidate_overlay();
 
             return;
         }
 
-        self.content.as_widget_mut().update(
+        self.content.update(
             &mut tree.children[0],
             event,
             layout,
             cursor,
             renderer,
-            clipboard,
             shell,
             viewport,
         );
@@ -764,11 +811,11 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.content.as_widget().draw(
+        self.content.draw(
             &tree.children[0],
             renderer,
             theme,
@@ -782,12 +829,12 @@ where
     fn mouse_interaction(
         &self,
         tree: &Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.content.as_widget().mouse_interaction(
+        self.content.mouse_interaction(
             &tree.children[0],
             layout,
             cursor,
@@ -799,42 +846,58 @@ where
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        _layout: Layout<'b>,
+        layout: Layout,
         renderer: &Renderer,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        window: Size,
+    ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
+        // The overlays of the wrapped content come first, so that the menu is
+        // drawn—and receives events—on top of them.
+        let mut overlays = self.content.overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+            window,
+        );
+
         let state = tree.state.downcast_mut::<State>();
 
         if !state.is_open() {
-            return None;
+            return overlays;
         }
 
         let mut menu = Menu::new(state, &self.entries)
             .translation(translation)
-            .font(self.font.unwrap_or_else(|| renderer.default_font()))
-            .text_size(
-                self.text_size.unwrap_or_else(|| renderer.default_size()),
-            );
+            .font(self.font.unwrap_or_else(|| renderer.font()))
+            .text_size(self.text_size.unwrap_or_else(|| renderer.text_size()));
 
         if let Some(class) = self.class.as_ref() {
             menu = menu.class(class);
         }
 
-        Some(menu.overlay())
+        overlays.push(menu.overlay(renderer, window));
+
+        overlays
     }
 }
 
-impl<'a, Message, Theme, Renderer>
-    From<ContextMenu<'a, Message, Theme, Renderer>>
+impl<'a, W, Message, Theme, Renderer> From<ContextMenu<'a, W, Message, Theme>>
     for Element<'a, Message, Theme, Renderer>
 where
+    W: Widget<Message, Theme, Renderer> + 'a,
     Message: 'a,
     Theme: Catalog + 'a,
     Renderer: text::Renderer + 'a,
 {
-    fn from(context_menu: ContextMenu<'a, Message, Theme, Renderer>) -> Self {
-        Element::new(context_menu)
+    fn from(context_menu: ContextMenu<'a, W, Message, Theme>) -> Self {
+        <ContextMenu<'a, W, Message, Theme> as Widget<
+            Message,
+            Theme,
+            Renderer,
+        >>::_boxed(context_menu)
     }
 }
 
@@ -855,6 +918,8 @@ pub struct Style {
     pub selected_text_color: Color,
     /// The [`Background`] of the hovered entry.
     pub selected_background: Background,
+    /// The [`Border`]—used for its radius—of the hovered entry.
+    pub selected_border: Border,
 }
 
 /// The theme catalog of a [`ContextMenu`].
@@ -885,24 +950,51 @@ impl Catalog for iced_widget::Theme {
 }
 
 /// The default style of a [`ContextMenu`].
+///
+/// A soft, rounded card that floats above the content: white (or slightly
+/// lifted, on dark themes), with generous padding, a wide corner radius and a
+/// diffuse shadow.
 pub fn default(theme: &iced_widget::Theme) -> Style {
-    let palette = theme.extended_palette();
+    let palette = theme.palette();
+
+    let (background, text_color, hover, border_color, shadow) =
+        if palette.is_dark {
+            (
+                palette.background.weak.color,
+                palette.background.weak.text,
+                palette.background.strong.color,
+                Color::from_rgba(1.0, 1.0, 1.0, 0.12),
+                Color::from_rgba(0.0, 0.0, 0.0, 0.55),
+            )
+        } else {
+            (
+                Color::WHITE,
+                palette.background.base.text,
+                palette.background.weak.color,
+                Color::from_rgba(0.0, 0.0, 0.0, 0.12),
+                Color::from_rgba(0.0, 0.0, 0.0, 0.22),
+            )
+        };
 
     Style {
-        background: palette.background.weak.color.into(),
+        background: background.into(),
         border: Border {
             width: 1.0,
-            radius: 2.0.into(),
-            color: palette.background.strong.color,
+            radius: BORDER_RADIUS.into(),
+            color: border_color,
         },
         shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.15),
-            offset: Vector::new(0.0, 2.0),
-            blur_radius: 8.0,
+            color: shadow,
+            offset: Vector::new(0.0, 8.0),
+            blur_radius: 28.0,
         },
-        text_color: palette.background.weak.text,
-        disabled_text_color: palette.background.weak.text.scale_alpha(0.5),
-        selected_text_color: palette.primary.strong.text,
-        selected_background: palette.primary.strong.color.into(),
+        text_color,
+        disabled_text_color: text_color.scale_alpha(0.4),
+        selected_text_color: text_color,
+        selected_background: hover.into(),
+        selected_border: Border {
+            radius: ITEM_BORDER_RADIUS.into(),
+            ..Border::default()
+        },
     }
 }

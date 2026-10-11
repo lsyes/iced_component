@@ -5,10 +5,10 @@
 //! on the messages that the menu entries publish.
 
 use iced_component::context_menu::{self, Entry, ITEM_HEIGHT, PADDING};
-use iced_test::core::{Element, Event, Point, Settings, Size, event, mouse};
+use iced_test::core::{Event, Point, Settings, Size, event, mouse};
 use iced_test::simulator::{self, Simulator};
 use iced_widget::core::Length;
-use iced_widget::{Renderer, Theme, container, text};
+use iced_widget::{Renderer, Theme, Widget, container, text};
 
 const VIEWPORT: Size = Size::new(800.0, 400.0);
 const ORIGIN: Point = Point::new(40.0, 40.0);
@@ -19,7 +19,7 @@ enum Message {
     Reload,
 }
 
-fn view() -> Element<'static, Message, Theme, Renderer> {
+fn view() -> impl Widget<Message, Theme, Renderer> {
     context_menu::context_menu(
         container(text("Right-click me"))
             .padding(20)
@@ -28,7 +28,6 @@ fn view() -> Element<'static, Message, Theme, Renderer> {
     )
     .entry(Entry::new("Copy", || Message::Copy))
     .entry(Entry::new("Reload", || Message::Reload).enabled(false))
-    .into()
 }
 
 /// The center of the menu entry with the given index, for a menu anchored at

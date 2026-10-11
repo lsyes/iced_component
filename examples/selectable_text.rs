@@ -10,7 +10,7 @@
 //! ```
 
 use iced::widget::{column, container, text};
-use iced::{Element, Fill, Task};
+use iced::{Fill, Task, Widget};
 use iced_component::selectable_text::selectable_text;
 
 pub fn main() -> iced::Result {
@@ -24,7 +24,7 @@ fn update(_state: &mut (), _message: ()) -> Task<()> {
     Task::none()
 }
 
-fn view(_state: &()) -> Element<'_, ()> {
+fn view(_state: &()) -> impl Widget<()> {
     let card = container(
         column![
             text("Selectable text").size(24),
@@ -55,5 +55,5 @@ fn view(_state: &()) -> Element<'_, ()> {
     .width(Fill)
     .style(container::rounded_box);
 
-    container(card).center(Fill).padding(24).into()
+    container(card).center(Fill).padding(24)
 }

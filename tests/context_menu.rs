@@ -6,17 +6,13 @@
 //! tests compute the menu geometry deterministically and drive real mouse
 //! events at those coordinates.
 
+use iced_component::context_menu::{ITEM_HEIGHT, PADDING};
 use iced_component::text_input::context_menu_text_input;
 use iced_test::core::{Element, Event, Point, Settings, Size, event, mouse};
 use iced_test::simulator::{self, Simulator};
 use iced_widget::{Renderer, Theme};
 
 const VIEWPORT: Size = Size::new(1024.0, 768.0);
-
-/// The menu is anchored at the right-click position and laid out with these
-/// constants (see `text_input`):
-const MENU_PADDING: f32 = 4.0;
-const MENU_ITEM_HEIGHT: f32 = 28.0;
 
 /// A point that is inside the text input of every [`view`] below.
 const INSIDE: Point = Point::new(10.0, 10.0);
@@ -55,10 +51,7 @@ fn secure_view(
 fn item_center(origin: Point, index: usize) -> Point {
     Point::new(
         origin.x + 70.0,
-        origin.y
-            + MENU_PADDING
-            + index as f32 * MENU_ITEM_HEIGHT
-            + MENU_ITEM_HEIGHT / 2.0,
+        origin.y + PADDING + index as f32 * ITEM_HEIGHT + ITEM_HEIGHT / 2.0,
     )
 }
 

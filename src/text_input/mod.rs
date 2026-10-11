@@ -26,37 +26,43 @@
 //!
 //! # Design
 //!
-//! The editing engine is the built-in [`TextInput`] itself: this widget is a
-//! thin wrapper that owns one and forwards `layout`, `operate`, `draw` and
-//! every event to it. Selection, dragging, undo, IME, secure input and
-//! clipboard integration therefore behave *exactly* like they do in the
+//! The editing engine is the one the built-in [`TextInput`] itself uses:
+//! [`text::Input`] owns the [`Editor`], the focus and the placeholder of a
+//! field, and knows how to lay it out, feed it events and paint it. This widget
+//! is a thin wrapper around that engine, so selection, dragging, undo, IME,
+//! secure input and clipboard integration behave *exactly* like they do in the
 //! standard widget, instead of being reimplemented here.
 //!
 //! Only two things are added on top:
 //!
-//! 1. **A right-click opens the shared [`context_menu`](crate::context_menu)**,
+//! 1. **A right-click opens the shared [`crate::context_menu`]**,
 //!    which is a widget of its own. On an unfocused input, the click is
 //!    replayed as a left click so that the caret lands exactly where iced would
 //!    have put it; a focused input is left alone, so that right-clicking a
 //!    selection keeps it.
-//! 2. **A chosen entry dispatches a synthetic keyboard shortcut** (for instance
-//!    `Ctrl+X` for *Cut*) to the wrapped input. Because the input handles that
-//!    shortcut itself, the action reuses iced's own editing and clipboard
-//!    plumbing—including the `on_input` / `on_paste` messages—rather than
-//!    duplicating it.
+//! 2. **A chosen entry feeds a synthetic editor [`Binding`] to the engine** (for
+//!    instance `Cut` for *Cut*). Because the engine handles that binding itself,
+//!    the action reuses iced's own editing and clipboard plumbing—including the
+//!    `on_input` / `on_paste` messages—rather than duplicating it.
+//!
+//! [`TextInput`]: iced_widget::text_input::TextInput
+//! [`Editor`]: iced_core::text::Editor
+//! [`Binding`]: iced_core::text::editor::Binding
 
-use iced_core::clipboard::Clipboard;
+use std::borrow::Cow;
+
 use iced_core::keyboard;
-use iced_core::keyboard::key::{Code, Physical};
 use iced_core::mouse;
 use iced_core::text;
-use iced_core::widget;
+use iced_core::text::editor::Binding;
+use iced_core::widget::operation::Focusable as _;
 use iced_core::widget::tree::{self, Tree};
+use iced_core::window;
 use iced_core::{
-    Element, Event, Layout, Length, Padding, Pixels, Rectangle, Shell, Size,
-    Vector, Widget, alignment, layout, overlay, renderer,
+    Element, Event, Font, Layout, Length, Padding, Pixels, Rectangle, Shell,
+    Size, Vector, Widget, renderer,
 };
-use iced_widget::text_input::{self, Status, Style, TextInput};
+use iced_widget::text_input::{self, Status, Style};
 
 use crate::context_menu::{self, Entry, Menu};
 
@@ -67,52 +73,70 @@ pub const DEFAULT_PADDING: Padding = text_input::DEFAULT_PADDING;
 ///
 /// It offers the same builder API as [`TextInput`], plus
 /// [`context_menu`](Self::context_menu) and [`menu_style`](Self::menu_style).
-pub struct ContextMenuTextInput<
-    'a,
-    Message,
-    Theme = iced_widget::Theme,
-    Renderer = iced_widget::Renderer,
-> where
+///
+/// [`TextInput`]: iced_widget::text_input::TextInput
+pub struct ContextMenuTextInput<'a, Message, Theme = iced_widget::Theme>
+where
     Theme: text_input::Catalog + context_menu::Catalog,
-    Renderer: text::Renderer,
 {
-    inner: TextInput<'a, Message, Theme, Renderer>,
+    id: Option<iced_core::widget::Id>,
+    placeholder: Cow<'a, str>,
+    value: Cow<'a, str>,
     entries: Vec<Entry<'a, Message>>,
-    value: String,
-    is_enabled: bool,
+    on_input: Option<Box<dyn Fn(String) -> Message + 'a>>,
+    on_paste: Option<Box<dyn Fn(String) -> Message + 'a>>,
+    on_submit: Option<Message>,
     is_secure: bool,
     has_context_menu: bool,
+    font: Option<Font>,
+    width: Length,
+    height: Length,
+    padding: Padding,
+    size: Option<Pixels>,
+    line_height: Option<text::LineHeight>,
+    alignment: text::Alignment,
+    class: <Theme as text_input::Catalog>::Class<'a>,
     menu_class: Option<<Theme as context_menu::Catalog>::Class<'a>>,
-    font: Option<Renderer::Font>,
-    text_size: Option<Pixels>,
+    last_status: Option<Status>,
 }
 
-impl<'a, Message, Theme, Renderer>
-    ContextMenuTextInput<'a, Message, Theme, Renderer>
+impl<'a, Message, Theme> ContextMenuTextInput<'a, Message, Theme>
 where
     Message: Clone,
     Theme: text_input::Catalog + context_menu::Catalog,
-    Renderer: text::Renderer,
 {
     /// Creates a new [`ContextMenuTextInput`] with the given placeholder and
     /// its current value.
-    pub fn new(placeholder: &str, value: &str) -> Self {
+    pub fn new(
+        placeholder: impl Into<Cow<'a, str>>,
+        value: impl Into<Cow<'a, str>>,
+    ) -> Self {
         Self {
-            inner: TextInput::new(placeholder, value),
+            id: None,
+            placeholder: placeholder.into(),
+            value: value.into(),
             entries: Vec::new(),
-            value: String::from(value),
-            is_enabled: false,
+            on_input: None,
+            on_paste: None,
+            on_submit: None,
             is_secure: false,
             has_context_menu: true,
-            menu_class: None,
             font: None,
-            text_size: None,
+            width: Length::Fill,
+            height: Length::Fit,
+            padding: DEFAULT_PADDING,
+            size: None,
+            line_height: None,
+            alignment: text::Alignment::Default,
+            class: <Theme as text_input::Catalog>::default(),
+            menu_class: None,
+            last_status: None,
         }
     }
 
-    /// Sets the [`widget::Id`] of the input.
-    pub fn id(mut self, id: impl Into<widget::Id>) -> Self {
-        self.inner = self.inner.id(id);
+    /// Sets the [`iced_core::widget::Id`] of the input.
+    pub fn id(mut self, id: impl Into<iced_core::widget::Id>) -> Self {
+        self.id = Some(id.into());
         self
     }
 
@@ -122,7 +146,6 @@ where
     /// corresponding shortcuts are in the built-in widget.
     pub fn secure(mut self, is_secure: bool) -> Self {
         self.is_secure = is_secure;
-        self.inner = self.inner.secure(is_secure);
         self
     }
 
@@ -130,6 +153,8 @@ where
     ///
     /// It is enabled by default. When disabled, right-clicks are ignored
     /// exactly like they are by [`TextInput`].
+    ///
+    /// [`TextInput`]: iced_widget::text_input::TextInput
     pub fn context_menu(mut self, context_menu: bool) -> Self {
         self.has_context_menu = context_menu;
         self
@@ -144,15 +169,14 @@ where
         mut self,
         on_input: impl Fn(String) -> Message + 'a,
     ) -> Self {
-        self.is_enabled = true;
-        self.inner = self.inner.on_input(on_input);
+        self.on_input = Some(Box::new(on_input));
         self
     }
 
     /// Sets the message that should be produced when the input is focused and
     /// the enter key is pressed.
     pub fn on_submit(mut self, message: Message) -> Self {
-        self.inner = self.inner.on_submit(message);
+        self.on_submit = Some(message);
         self
     }
 
@@ -162,35 +186,37 @@ where
         mut self,
         on_paste: impl Fn(String) -> Message + 'a,
     ) -> Self {
-        self.inner = self.inner.on_paste(on_paste);
+        self.on_paste = Some(Box::new(on_paste));
         self
     }
 
     /// Sets the font of the input.
-    pub fn font(mut self, font: Renderer::Font) -> Self {
-        self.font = Some(font);
-        self.inner = self.inner.font(font);
+    pub fn font(mut self, font: impl Into<Font>) -> Self {
+        self.font = Some(font.into());
         self
     }
 
     /// Sets the width of the input.
     pub fn width(mut self, width: impl Into<Length>) -> Self {
-        self.inner = self.inner.width(width);
+        self.width = width.into();
+        self
+    }
+
+    /// Sets the height of the input.
+    pub fn height(mut self, height: impl Into<Length>) -> Self {
+        self.height = height.into();
         self
     }
 
     /// Sets the [`Padding`] of the input.
     pub fn padding<P: Into<Padding>>(mut self, padding: P) -> Self {
-        self.inner = self.inner.padding(padding);
+        self.padding = padding.into();
         self
     }
 
     /// Sets the text size of the input.
     pub fn size(mut self, size: impl Into<Pixels>) -> Self {
-        let size = size.into();
-
-        self.text_size = Some(size);
-        self.inner = self.inner.size(size);
+        self.size = Some(size.into());
         self
     }
 
@@ -199,16 +225,13 @@ where
         mut self,
         line_height: impl Into<text::LineHeight>,
     ) -> Self {
-        self.inner = self.inner.line_height(line_height);
+        self.line_height = Some(line_height.into());
         self
     }
 
     /// Sets the horizontal alignment of the input.
-    pub fn align_x(
-        mut self,
-        alignment: impl Into<alignment::Horizontal>,
-    ) -> Self {
-        self.inner = self.inner.align_x(alignment);
+    pub fn align_x(mut self, alignment: impl Into<text::Alignment>) -> Self {
+        self.alignment = alignment.into();
         self
     }
 
@@ -219,13 +242,23 @@ where
         <Theme as text_input::Catalog>::Class<'a>:
             From<text_input::StyleFn<'a, Theme>>,
     {
-        self.inner = self.inner.style(style);
+        self.class = (Box::new(style) as text_input::StyleFn<'a, Theme>).into();
+        self
+    }
+
+    /// Sets the style class of the input.
+    #[must_use]
+    pub fn class(
+        mut self,
+        class: impl Into<<Theme as text_input::Catalog>::Class<'a>>,
+    ) -> Self {
+        self.class = class.into();
         self
     }
 
     /// Sets the style of the context menu.
     ///
-    /// By default the menu reuses the default style of the [`Theme`].
+    /// By default the menu reuses the default style of the [`Theme`](iced_widget::Theme).
     #[must_use]
     pub fn menu_style(
         mut self,
@@ -242,81 +275,107 @@ where
 }
 
 /// Creates a new [`ContextMenuTextInput`].
-pub fn context_menu_text_input<'a, Message, Theme, Renderer>(
-    placeholder: &str,
-    value: &str,
-) -> ContextMenuTextInput<'a, Message, Theme, Renderer>
+pub fn context_menu_text_input<'a, Message, Theme>(
+    placeholder: impl Into<Cow<'a, str>>,
+    value: impl Into<Cow<'a, str>>,
+) -> ContextMenuTextInput<'a, Message, Theme>
 where
     Message: Clone,
     Theme: text_input::Catalog + context_menu::Catalog,
-    Renderer: text::Renderer,
 {
     ContextMenuTextInput::new(placeholder, value)
 }
 
 /// The persistent state of a [`ContextMenuTextInput`].
-#[derive(Debug, Default)]
-struct State {
+struct State<R: text::Renderer> {
+    input: text::Input<R>,
+    value: String,
     menu: context_menu::State,
-    keyboard_modifiers: keyboard::Modifiers,
+}
+
+impl<R: text::Renderer> Default for State<R> {
+    fn default() -> Self {
+        Self {
+            input: text::Input::new(),
+            value: String::new(),
+            menu: context_menu::State::new(),
+        }
+    }
+}
+
+impl<Message, Theme> iced_core::widget::Meta
+    for ContextMenuTextInput<'_, Message, Theme>
+where
+    Theme: text_input::Catalog + context_menu::Catalog,
+{
 }
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
-    for ContextMenuTextInput<'_, Message, Theme, Renderer>
+    for ContextMenuTextInput<'_, Message, Theme>
 where
     Message: Clone,
     Theme: text_input::Catalog + context_menu::Catalog,
-    Renderer: text::Renderer,
+    Renderer: text::Renderer + 'static,
 {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State>()
+        tree::Tag::of::<State<Renderer>>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State::default())
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        ensure_input_tree(tree, &self.inner);
-        self.inner.diff(&mut tree.children[0]);
+        tree::State::new(State::<Renderer>::default())
     }
 
     fn size(&self) -> Size<Length> {
-        // The inherent `TextInput::size` builder shadows the trait method.
-        <TextInput<'_, Message, Theme, Renderer> as Widget<
-            Message,
-            Theme,
-            Renderer,
-        >>::size(&self.inner)
+        Size {
+            width: self.width,
+            height: self.height,
+        }
     }
 
     fn layout(
         &mut self,
         tree: &mut Tree,
         renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        ensure_input_tree(tree, &self.inner);
+        limits: &iced_core::layout::Limits,
+    ) {
+        let state = tree.state.downcast_mut::<State<Renderer>>();
 
-        // The inherent `TextInput::layout` is a different, lower-level method.
-        <TextInput<'_, Message, Theme, Renderer> as Widget<
-            Message,
-            Theme,
-            Renderer,
-        >>::layout(
-            &mut self.inner, &mut tree.children[0], renderer, limits
-        )
+        if state.value != self.value.as_ref() {
+            state.input.overwrite(&self.value);
+            state.value = self.value.to_string();
+        }
+
+        tree.size = state.input.layout(
+            renderer,
+            limits,
+            text::input::Layout {
+                width: self.width,
+                height: self.height,
+                padding: self.padding,
+                placeholder: &self.placeholder,
+                font: self.font,
+                size: self.size,
+                line_height: self.line_height,
+                alignment: self.alignment,
+                multiline: None,
+                is_secure: self.is_secure,
+            },
+        );
     }
 
     fn operate(
         &mut self,
         tree: &mut Tree,
-        layout: Layout<'_>,
-        renderer: &Renderer,
-        operation: &mut dyn widget::Operation,
+        layout: Layout,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
     ) {
-        self.inner
-            .operate(&mut tree.children[0], layout, renderer, operation);
+        let state = tree.state.downcast_mut::<State<Renderer>>();
+        let bounds = layout.bounds();
+
+        operation.text_input(self.id.as_ref(), bounds, &mut state.input);
+        operation.focusable(self.id.as_ref(), bounds, &mut state.input);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -324,52 +383,38 @@ where
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
+        _renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
+        _viewport: &Rectangle,
     ) {
-        // The user's modifiers are remembered so that a menu entry can restore
-        // them after faking its own shortcut.
-        if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) =
-            event
-        {
-            tree.state.downcast_mut::<State>().keyboard_modifiers = *modifiers;
-        }
+        let state = tree.state.downcast_mut::<State<Renderer>>();
+        let bounds = layout.bounds();
 
         // A right-click opens the menu. On an unfocused input, replaying it as
-        // a left click makes the built-in widget focus itself and drop the
-        // caret right where the user clicked, without this wrapper having to
-        // know anything about text layout. A focused input is left alone, so
-        // that right-clicking a selection keeps it.
+        // a left click makes the engine focus itself and drop the caret right
+        // where the user clicked, without this wrapper having to know anything
+        // about text layout. A focused input is left alone, so that
+        // right-clicking a selection keeps it.
         if self.has_context_menu
-            && self.is_enabled
+            && self.on_input.is_some()
             && let Event::Mouse(mouse::Event::ButtonPressed(
                 mouse::Button::Right,
             )) = event
-            && let Some(position) = cursor.position_over(layout.bounds())
+            && let Some(position) = cursor.observe().position_over(bounds)
         {
-            let is_focused = tree.children[0]
-                .state
-                .downcast_ref::<text_input::State<Renderer::Paragraph>>()
-                .is_focused();
-
-            if !is_focused {
+            if !state.input.is_focused() {
                 for click in [
                     mouse::Event::ButtonPressed(mouse::Button::Left),
                     mouse::Event::ButtonReleased(mouse::Button::Left),
                 ] {
-                    self.inner.update(
-                        &mut tree.children[0],
+                    let _ = state.input.update(
                         &Event::Mouse(click),
-                        layout,
+                        bounds,
                         cursor,
-                        renderer,
-                        clipboard,
                         shell,
-                        viewport,
+                        |key_press| Binding::from_key_press(key_press),
                     );
                 }
             }
@@ -377,29 +422,72 @@ where
             self.entries = Action::ALL
                 .iter()
                 .map(|action| {
-                    Entry::dispatch(action.label())
-                        .enabled(action.is_enabled(&self.value, self.is_secure))
+                    Entry::dispatch(action.label()).enabled(
+                        action.is_enabled(&state.value, self.is_secure),
+                    )
                 })
                 .collect();
 
-            tree.state.downcast_mut::<State>().menu.open(position);
+            state.menu.open(position);
 
             shell.capture_event();
             shell.request_redraw();
+            shell.invalidate_overlay();
 
             return;
         }
 
-        self.inner.update(
-            &mut tree.children[0],
-            event,
-            layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-        );
+        let is_disabled = self.on_input.is_none();
+
+        if let Some(on_input) = &self.on_input {
+            let edit =
+                state
+                    .input
+                    .update(event, bounds, cursor, shell, |key_press| {
+                        Binding::from_key_press(key_press)
+                    });
+
+            if let Some(edit) = edit {
+                let on_input = if let Some(on_paste) = &self.on_paste
+                    && edit.has_pasted
+                {
+                    on_paste
+                } else {
+                    on_input
+                };
+
+                state.value = state.input.value();
+
+                shell.publish(on_input(state.value.clone()));
+            }
+        }
+
+        let status = if is_disabled {
+            Status::Disabled
+        } else if state.input.is_focused() {
+            Status::Focused {
+                is_hovered: cursor.is_over(bounds),
+            }
+        } else if cursor.is_over(bounds) {
+            Status::Hovered
+        } else {
+            Status::Active
+        };
+
+        if let Event::Window(window::Event::RedrawRequested(_now)) = event {
+            self.last_status = Some(status);
+
+            shell.request_input_method(
+                &state
+                    .input
+                    .input_method(bounds.shrink(self.padding).position()),
+            );
+        } else if self
+            .last_status
+            .is_some_and(|last_status| status != last_status)
+        {
+            shell.request_redraw();
+        }
     }
 
     fn draw(
@@ -407,116 +495,136 @@ where
         tree: &Tree,
         renderer: &mut Renderer,
         theme: &Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
+        _style: &renderer::Style,
+        layout: Layout,
+        _cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        // The inherent `TextInput::draw` is a different, lower-level method.
-        <TextInput<'_, Message, Theme, Renderer> as Widget<
-            Message,
-            Theme,
-            Renderer,
-        >>::draw(
-            &self.inner,
-            &tree.children[0],
-            renderer,
+        let state = tree.state.downcast_ref::<State<Renderer>>();
+        let style = <Theme as text_input::Catalog>::style(
             theme,
-            style,
-            layout,
-            cursor,
-            viewport,
+            &self.class,
+            self.last_status.unwrap_or(Status::Disabled),
+        );
+
+        let bounds = layout.bounds();
+
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border: style.border,
+                ..renderer::Quad::default()
+            },
+            style.background,
+        );
+
+        state.input.draw(
+            renderer,
+            bounds,
+            *viewport,
+            text::input::Style {
+                value: style.value,
+                selection: style.selection,
+                placeholder: style.placeholder,
+            },
         );
     }
 
     fn mouse_interaction(
         &self,
-        tree: &Tree,
-        layout: Layout<'_>,
+        _tree: &Tree,
+        layout: Layout,
         cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &Renderer,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.inner.mouse_interaction(
-            &tree.children[0],
-            layout,
-            cursor,
-            viewport,
-            renderer,
-        )
+        if cursor.is_over(layout.bounds()) {
+            if self.on_input.is_none() {
+                mouse::Interaction::Idle
+            } else {
+                mouse::Interaction::Text
+            }
+        } else {
+            mouse::Interaction::default()
+        }
     }
 
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        layout: Layout<'b>,
+        layout: Layout,
         renderer: &Renderer,
-        viewport: &Rectangle,
+        _viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        let state = tree.state.downcast_mut::<State>();
+        window: Size,
+    ) -> Vec<iced_core::overlay::Element<'b, Message, Theme, Renderer>> {
+        let state = tree.state.downcast_mut::<State<Renderer>>();
 
-        state.menu.position()?;
+        if !state.menu.is_open() {
+            return Vec::new();
+        }
 
-        let input_tree = tree.children.first_mut()?;
+        let bounds = layout.bounds();
 
-        let mut shortcuts = Shortcuts {
-            input: &mut self.inner,
-            tree: input_tree,
-            layout,
-            viewport: *viewport,
-            keyboard_modifiers: state.keyboard_modifiers,
-        };
+        let State { input, value, menu } = state;
 
-        let mut menu = Menu::new(&mut state.menu, &self.entries)
+        let on_input = self.on_input.as_ref();
+        let on_paste = self.on_paste.as_ref();
+
+        let mut menu = Menu::new(menu, &self.entries)
             .translation(translation)
-            .font(self.font.unwrap_or_else(|| renderer.default_font()))
-            .text_size(
-                self.text_size.unwrap_or_else(|| renderer.default_size()),
-            )
-            .on_dispatch(move |index, renderer, clipboard, shell| {
-                shortcuts.perform(index, renderer, clipboard, shell);
+            .font(self.font.unwrap_or_else(|| renderer.font()))
+            .text_size(self.size.unwrap_or_else(|| renderer.text_size()))
+            .on_dispatch(move |index, shell| {
+                let Some(action) = Action::ALL.get(index).copied() else {
+                    return;
+                };
+
+                // The engine reports an edit exactly when the value changed;
+                // that is when the application must be told about it.
+                let Some(edit) = action.dispatch(input, bounds, shell) else {
+                    return;
+                };
+
+                let Some(on_input) = on_input else {
+                    return;
+                };
+
+                let on_input = if let Some(on_paste) = on_paste
+                    && edit.has_pasted
+                {
+                    on_paste
+                } else {
+                    on_input
+                };
+
+                *value = input.value();
+
+                shell.publish(on_input(value.clone()));
             });
 
         if let Some(class) = self.menu_class.as_ref() {
             menu = menu.class(class);
         }
 
-        Some(menu.overlay())
+        vec![menu.overlay(renderer, window)]
     }
 }
 
 impl<'a, Message, Theme, Renderer>
-    From<ContextMenuTextInput<'a, Message, Theme, Renderer>>
+    From<ContextMenuTextInput<'a, Message, Theme>>
     for Element<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
     Theme: text_input::Catalog + context_menu::Catalog + 'a,
     Renderer: text::Renderer + 'a,
 {
-    fn from(input: ContextMenuTextInput<'a, Message, Theme, Renderer>) -> Self {
-        Element::new(input)
-    }
-}
-
-/// Ensures the wrapped [`TextInput`] has a child [`Tree`] of the correct shape.
-fn ensure_input_tree<Message, Theme, Renderer>(
-    tree: &mut Tree,
-    inner: &TextInput<'_, Message, Theme, Renderer>,
-) where
-    Message: Clone,
-    Theme: text_input::Catalog,
-    Renderer: text::Renderer,
-{
-    let tag = inner.tag();
-
-    if tree.children.is_empty() || tree.children[0].tag != tag {
-        tree.children.clear();
-        tree.children.push(Tree {
-            tag,
-            state: inner.state(),
-            children: inner.children(),
-        });
+    fn from(input: ContextMenuTextInput<'a, Message, Theme>) -> Self {
+        <ContextMenuTextInput<'a, Message, Theme> as Widget<
+            Message,
+            Theme,
+            Renderer,
+        >>::_boxed(input)
     }
 }
 
@@ -542,25 +650,46 @@ impl Action {
         }
     }
 
-    /// The latin character of the shortcut that triggers this action in the
-    /// built-in [`TextInput`].
-    fn character(self) -> &'static str {
+    /// The editor [`Binding`] that performs this action.
+    fn binding<Message>(self) -> Binding<Message> {
         match self {
-            Action::Cut => "x",
-            Action::Copy => "c",
-            Action::Paste => "v",
-            Action::SelectAll => "a",
+            Action::Cut => Binding::Cut,
+            Action::Copy => Binding::Copy,
+            Action::Paste => Binding::Paste,
+            Action::SelectAll => Binding::SelectAll,
         }
     }
 
-    /// The physical key of the shortcut that triggers this action.
-    fn code(self) -> Code {
-        match self {
-            Action::Cut => Code::KeyX,
-            Action::Copy => Code::KeyC,
-            Action::Paste => Code::KeyV,
-            Action::SelectAll => Code::KeyA,
-        }
+    /// Runs the action on the input engine by feeding it a synthetic key press
+    /// bound to this action.
+    fn dispatch<Message, R>(
+        self,
+        input: &mut text::Input<R>,
+        bounds: Rectangle,
+        shell: &mut Shell<'_, Message>,
+    ) -> Option<text::input::Edit>
+    where
+        R: text::Renderer,
+    {
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(" ".into()),
+            modified_key: keyboard::Key::Character(" ".into()),
+            physical_key: keyboard::key::Physical::Code(
+                keyboard::key::Code::Space,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            text: None,
+            repeat: false,
+        });
+
+        input.update(
+            &event,
+            bounds,
+            mouse::Cursor::Unavailable,
+            shell,
+            move |_| Some(self.binding()),
+        )
     }
 
     fn is_enabled(self, value: &str, is_secure: bool) -> bool {
@@ -570,93 +699,5 @@ impl Action {
             Action::Paste => true,
             Action::SelectAll => !value.is_empty(),
         }
-    }
-}
-
-/// Everything needed to feed a synthetic shortcut to the wrapped [`TextInput`].
-struct Shortcuts<'a, 'b, Message, Theme, Renderer>
-where
-    Theme: text_input::Catalog,
-    Renderer: text::Renderer,
-{
-    input: &'b mut TextInput<'a, Message, Theme, Renderer>,
-    tree: &'b mut Tree,
-    layout: Layout<'b>,
-    viewport: Rectangle,
-    keyboard_modifiers: keyboard::Modifiers,
-}
-
-impl<Message, Theme, Renderer> Shortcuts<'_, '_, Message, Theme, Renderer>
-where
-    Message: Clone,
-    Theme: text_input::Catalog,
-    Renderer: text::Renderer,
-{
-    /// Replays the keyboard shortcut of the chosen [`Action`].
-    fn perform(
-        &mut self,
-        index: usize,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Message>,
-    ) {
-        let Some(action) = Action::ALL.get(index).copied() else {
-            return;
-        };
-
-        let modifiers = self.keyboard_modifiers;
-
-        // Pretend the platform modifier is held...
-        self.dispatch(
-            keyboard::Event::ModifiersChanged(keyboard::Modifiers::COMMAND),
-            renderer,
-            clipboard,
-            shell,
-        );
-
-        // ...press the shortcut...
-        let key = keyboard::Key::Character(action.character().into());
-
-        self.dispatch(
-            keyboard::Event::KeyPressed {
-                key: key.clone(),
-                modified_key: key,
-                physical_key: Physical::Code(action.code()),
-                location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::COMMAND,
-                text: None,
-                repeat: false,
-            },
-            renderer,
-            clipboard,
-            shell,
-        );
-
-        // ...and give the user their modifiers back.
-        self.dispatch(
-            keyboard::Event::ModifiersChanged(modifiers),
-            renderer,
-            clipboard,
-            shell,
-        );
-    }
-
-    fn dispatch(
-        &mut self,
-        event: keyboard::Event,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Message>,
-    ) {
-        self.input.update(
-            self.tree,
-            &Event::Keyboard(event),
-            self.layout,
-            mouse::Cursor::Unavailable,
-            renderer,
-            clipboard,
-            shell,
-            &self.viewport,
-        );
     }
 }

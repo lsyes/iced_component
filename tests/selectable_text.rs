@@ -9,12 +9,10 @@
 
 use iced_component::context_menu::{ITEM_HEIGHT, PADDING};
 use iced_component::selectable_text::selectable_text;
-use iced_test::core::{
-    Element, Event, Point, Settings, Size, event, keyboard, mouse,
-};
+use iced_test::core::{Event, Point, Settings, Size, event, keyboard, mouse};
 use iced_test::simulator::{self, Simulator};
 use iced_widget::core::Length;
-use iced_widget::{Renderer, Theme, container};
+use iced_widget::{Renderer, Theme, Widget, container};
 
 const VIEWPORT: Size = Size::new(800.0, 400.0);
 const TEXT: &str = "hello selectable world";
@@ -22,20 +20,18 @@ const TEXT: &str = "hello selectable world";
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Message {}
 
-fn view() -> Element<'static, Message, Theme, Renderer> {
+fn view() -> impl Widget<Message, Theme, Renderer> {
     container(selectable_text(TEXT).size(20))
         .padding(20)
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
 }
 
-fn view_without_menu() -> Element<'static, Message, Theme, Renderer> {
+fn view_without_menu() -> impl Widget<Message, Theme, Renderer> {
     container(selectable_text(TEXT).size(20).context_menu(false))
         .padding(20)
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
 }
 
 fn right_click(

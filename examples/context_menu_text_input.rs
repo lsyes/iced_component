@@ -10,7 +10,7 @@
 //! ```
 
 use iced::widget::{Space, column, container, row, text};
-use iced::{Alignment, Element, Fill, Length, Task};
+use iced::{Alignment, Fill, Length, Task, Widget};
 use iced_component::text_input::{
     ContextMenuTextInput, context_menu_text_input,
 };
@@ -41,7 +41,7 @@ impl Demo {
         Task::none()
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self) -> impl Widget<Message> {
         let input: ContextMenuTextInput<'_, Message> =
             context_menu_text_input("Right-click me...", &self.content)
                 .on_input(Message::ContentChanged)
@@ -72,6 +72,6 @@ impl Demo {
         .width(Length::Fixed(440.0))
         .style(container::rounded_box);
 
-        container(card).center(Fill).padding(24).into()
+        container(card).center(Fill).padding(24)
     }
 }

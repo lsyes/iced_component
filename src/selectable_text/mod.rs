@@ -1,10 +1,10 @@
 //! Text that can be selected, with a right-click menu.
 //!
-//! [`SelectableText`] renders a string like [`iced_widget::text`] does, but the
+//! [`SelectableText`] renders a string like [`iced_widget::text()`] does, but the
 //! user can select it with the mouse—click to place a cursor, drag to select a
 //! range, double-click for a word, triple-click for a line—and copy it with
 //! `Ctrl`/`Cmd` + `C`, `Ctrl`/`Cmd` + `A`, or through the right-click
-//! [`context_menu`](crate::context_menu).
+//! [`crate::context_menu`].
 //!
 //! # Example
 //!
@@ -20,45 +20,40 @@
 //!
 //! The text is laid out and rendered by the [`Editor`] that every
 //! [`text::Renderer`] already provides—the very same engine that powers
-//! [`iced_widget::text_editor`]. That is what makes crisp selection geometry,
+//! [`iced_widget::text_editor()`]. That is what makes crisp selection geometry,
 //! bidirectional text, wrapping and font shaping work without reimplementing
 //! them here.
 //!
 //! The widget only ever performs *selection* actions on that editor, never
 //! editing ones, which is what makes it read-only. Copying goes straight to the
-//! [`Clipboard`] the runtime hands to [`Widget::update`], through
+//! [`Clipboard`] the runtime exposes through the [`Shell`], via
 //! [`Editor::copy`].
 //!
 //! [`Editor`]: iced_core::text::editor::Editor
 //! [`Editor::copy`]: iced_core::text::editor::Editor::copy
+//! [`Clipboard`]: iced_core::clipboard
 
 use std::borrow::Cow;
 
-use iced_core::clipboard::{self, Clipboard};
+use iced_core::clipboard;
 use iced_core::keyboard;
 use iced_core::mouse;
 use iced_core::text;
 use iced_core::text::editor::{Action, Editor as _, Selection};
-use iced_core::text::highlighter::PlainText;
 use iced_core::touch;
 use iced_core::widget::tree::{self, Tree};
 use iced_core::window;
 use iced_core::{
-    Color, Element, Event, Layout, Length, Padding, Pixels, Point, Rectangle,
-    Shell, Size, Vector, Widget, layout, overlay, renderer,
+    Color, Element, Event, Font, Layout, Length, Padding, Pixels, Point,
+    Rectangle, Shell, Size, Vector, Widget, layout, overlay, renderer,
 };
 
 use crate::context_menu::{self, Entry, Menu};
 
 /// Text that can be selected with the mouse and copied to the clipboard.
-pub struct SelectableText<
-    'a,
-    Message,
-    Theme = iced_widget::Theme,
-    Renderer = iced_widget::Renderer,
-> where
+pub struct SelectableText<'a, Message, Theme = iced_widget::Theme>
+where
     Theme: Catalog + context_menu::Catalog,
-    Renderer: text::Renderer,
 {
     content: Cow<'a, str>,
     id: Option<iced_core::widget::Id>,
@@ -68,17 +63,17 @@ pub struct SelectableText<
     padding: Padding,
     size: Option<Pixels>,
     line_height: Option<text::LineHeight>,
-    font: Option<Renderer::Font>,
+    font: Option<Font>,
     wrapping: text::Wrapping,
+    alignment: text::Alignment,
     context_menu: bool,
     class: <Theme as Catalog>::Class<'a>,
     menu_class: Option<<Theme as context_menu::Catalog>::Class<'a>>,
 }
 
-impl<'a, Message, Theme, Renderer> SelectableText<'a, Message, Theme, Renderer>
+impl<'a, Message, Theme> SelectableText<'a, Message, Theme>
 where
     Theme: Catalog + context_menu::Catalog,
-    Renderer: text::Renderer,
 {
     /// Creates a new [`SelectableText`] with the given content.
     pub fn new(content: impl Into<Cow<'a, str>>) -> Self {
@@ -96,6 +91,7 @@ where
             line_height: None,
             font: None,
             wrapping: text::Wrapping::default(),
+            alignment: text::Alignment::Default,
             context_menu: true,
             class: <Theme as Catalog>::default(),
             menu_class: None,
@@ -124,8 +120,14 @@ where
     }
 
     /// Sets the font of the text.
-    pub fn font(mut self, font: Renderer::Font) -> Self {
-        self.font = Some(font);
+    pub fn font(mut self, font: impl Into<Font>) -> Self {
+        self.font = Some(font.into());
+        self
+    }
+
+    /// Sets the horizontal alignment of the text.
+    pub fn align_x(mut self, alignment: impl Into<text::Alignment>) -> Self {
+        self.alignment = alignment.into();
         self
     }
 
@@ -182,7 +184,7 @@ where
 
     /// Sets the style of the context menu.
     ///
-    /// By default the menu reuses the default style of the [`Theme`].
+    /// By default the menu reuses the default style of the [`Theme`](iced_widget::Theme).
     #[must_use]
     pub fn menu_style(
         mut self,
@@ -203,12 +205,11 @@ where
 }
 
 /// Creates a new [`SelectableText`] with the given content.
-pub fn selectable_text<'a, Message, Theme, Renderer>(
+pub fn selectable_text<'a, Message, Theme>(
     content: impl Into<Cow<'a, str>>,
-) -> SelectableText<'a, Message, Theme, Renderer>
+) -> SelectableText<'a, Message, Theme>
 where
     Theme: Catalog + context_menu::Catalog,
-    Renderer: text::Renderer,
 {
     SelectableText::new(content)
 }
@@ -281,8 +282,59 @@ fn interaction(event: &Event, cursor: mouse::Cursor) -> Option<Interaction> {
     }
 }
 
+/// Exposes the contents of a [`SelectableText`] to widget operations, which is
+/// what makes it discoverable through selectors like `iced_test`'s.
+struct TextOperation<'a, E: iced_core::text::editor::Editor> {
+    state: &'a mut State<E>,
+    text_bounds: Rectangle,
+}
+
+impl<E: iced_core::text::editor::Editor> iced_core::widget::operation::Text
+    for TextOperation<'_, E>
+{
+    fn text(&self) -> text::Fragment<'_> {
+        Cow::Borrowed(self.state.content.as_str())
+    }
+
+    fn select(&mut self, start: Point, end: Point, _target: text::Target) {
+        let start = local(start, self.text_bounds);
+        let end = local(end, self.text_bounds);
+
+        self.state.is_focused = true;
+        self.state.last_click = None;
+
+        self.state
+            .editor
+            .perform(Action::Click(start, mouse::click::Kind::Single));
+
+        self.state.editor.perform(Action::Drag(end));
+    }
+
+    fn select_all(&mut self) {
+        self.state.is_focused = true;
+        self.state.editor.perform(Action::SelectAll);
+    }
+
+    fn deselect(&mut self) {
+        self.state
+            .editor
+            .perform(Action::Click(Point::ORIGIN, mouse::click::Kind::Single));
+    }
+
+    fn copy(&mut self) -> Option<String> {
+        self.state.editor.copy()
+    }
+}
+
+impl<Message, Theme> iced_core::widget::Meta
+    for SelectableText<'_, Message, Theme>
+where
+    Theme: Catalog + context_menu::Catalog,
+{
+}
+
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
-    for SelectableText<'_, Message, Theme, Renderer>
+    for SelectableText<'_, Message, Theme>
 where
     Theme: Catalog + context_menu::Catalog,
     Renderer: text::Renderer,
@@ -304,7 +356,7 @@ where
         tree: &mut Tree,
         renderer: &Renderer,
         limits: &layout::Limits,
-    ) -> layout::Node {
+    ) {
         let state = tree.state.downcast_mut::<State<Renderer::Editor>>();
 
         if state.content != self.content.as_ref() {
@@ -313,30 +365,41 @@ where
         }
 
         state.editor.update(
-            limits.shrink(self.padding).max(),
-            self.font.unwrap_or_else(|| renderer.default_font()),
-            self.size.unwrap_or_else(|| renderer.default_size()),
-            self.line_height.unwrap_or_default(),
+            limits.shrink(self.padding).bounds(),
+            self.font.unwrap_or_else(|| renderer.font()),
+            self.size.unwrap_or_else(|| renderer.text_size()),
+            self.line_height.unwrap_or_else(|| renderer.line_height()),
             self.wrapping,
-            &mut PlainText,
+            self.alignment,
+            renderer.hint_factor(),
+            &mut text::parser::PlainText,
         );
 
         let intrinsic =
             state.editor.min_bounds().expand(Size::from(self.padding));
 
-        layout::Node::new(limits.resolve(self.width, self.height, intrinsic))
+        tree.size = limits.resolve(self.width, self.height, intrinsic);
     }
 
     fn operate(
         &mut self,
-        _tree: &mut Tree,
-        layout: Layout<'_>,
+        tree: &mut Tree,
+        layout: Layout,
+        _viewport: &Rectangle,
         _renderer: &Renderer,
         operation: &mut dyn iced_core::widget::Operation,
     ) {
+        let state = tree.state.downcast_mut::<State<Renderer::Editor>>();
+
+        let text_bounds = layout.bounds().shrink(self.padding);
+
         // Reporting the text makes the widget discoverable through
         // `iced_test`'s selectors.
-        operation.text(self.id.as_ref(), layout.bounds(), &self.content);
+        operation.text(
+            self.id.as_ref(),
+            layout.bounds(),
+            &mut TextOperation { state, text_bounds },
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -344,10 +407,9 @@ where
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
@@ -368,7 +430,7 @@ where
             && let Event::Mouse(mouse::Event::ButtonPressed(
                 mouse::Button::Right,
             )) = event
-            && let Some(position) = cursor.position_over(bounds)
+            && let Some(position) = cursor.observe().position_over(bounds)
         {
             self.entries = vec![
                 Entry::dispatch("Copy").enabled(state.editor.copy().is_some()),
@@ -379,6 +441,7 @@ where
 
             shell.capture_event();
             shell.request_redraw();
+            shell.invalidate_overlay();
 
             return;
         }
@@ -407,14 +470,11 @@ where
                 state.drag_click = Some(click.kind());
                 state.menu.close();
 
-                state.editor.perform(match click.kind() {
-                    mouse::click::Kind::Single => Action::Click(position),
-                    mouse::click::Kind::Double => Action::SelectWord,
-                    mouse::click::Kind::Triple => Action::SelectLine,
-                });
+                state.editor.perform(Action::Click(position, click.kind()));
 
                 shell.capture_event();
                 shell.request_redraw();
+                shell.invalidate_overlay();
             }
             Some(Interaction::Move(position)) => {
                 // Only a single click starts a drag. A double click selects a
@@ -444,9 +504,8 @@ where
                         match key.to_latin(*physical_key) {
                             Some('c') => {
                                 if let Some(selection) = state.editor.copy() {
-                                    clipboard.write(
-                                        clipboard::Kind::Standard,
-                                        selection,
+                                    shell.write_clipboard(
+                                        clipboard::Content::Text(selection),
                                     );
                                 }
 
@@ -483,7 +542,7 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         _style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         _cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
@@ -493,12 +552,12 @@ where
 
         // The selection is painted first, so that the text stays legible on top
         // of it.
-        if let Selection::Range(ranges) = state.editor.selection() {
+        if let Some(Selection::Range(ranges)) = state.editor.selection() {
             let translation = text_bounds.position() - Point::ORIGIN;
 
-            for range in ranges {
+            for range in ranges.iter() {
                 if let Some(selection) =
-                    text_bounds.intersection(&(range + translation))
+                    text_bounds.intersection(&(*range + translation))
                 {
                     renderer.fill_quad(
                         renderer::Quad {
@@ -522,7 +581,7 @@ where
     fn mouse_interaction(
         &self,
         _tree: &Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
@@ -537,52 +596,57 @@ where
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        _layout: Layout<'b>,
+        _layout: Layout,
         renderer: &Renderer,
         _viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        window: Size,
+    ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
         let state = tree.state.downcast_mut::<State<Renderer::Editor>>();
 
-        state.menu.position()?;
+        if !state.menu.is_open() {
+            return Vec::new();
+        }
 
         let State { editor, menu, .. } = state;
 
         let mut menu = Menu::new(menu, &self.entries)
             .translation(translation)
-            .font(self.font.unwrap_or_else(|| renderer.default_font()))
-            .text_size(self.size.unwrap_or_else(|| renderer.default_size()))
-            .on_dispatch(
-                move |index, _renderer, clipboard, _shell| match index {
-                    0 => {
-                        if let Some(selection) = editor.copy() {
-                            clipboard
-                                .write(clipboard::Kind::Standard, selection);
-                        }
+            .font(self.font.unwrap_or_else(|| renderer.font()))
+            .text_size(self.size.unwrap_or_else(|| renderer.text_size()))
+            .on_dispatch(move |index, shell| match index {
+                0 => {
+                    if let Some(selection) = editor.copy() {
+                        shell.write_clipboard(clipboard::Content::Text(
+                            selection,
+                        ));
                     }
-                    1 => editor.perform(Action::SelectAll),
-                    _ => {}
-                },
-            );
+                }
+                1 => editor.perform(Action::SelectAll),
+                _ => {}
+            });
 
         if let Some(class) = self.menu_class.as_ref() {
             menu = menu.class(class);
         }
 
-        Some(menu.overlay())
+        vec![menu.overlay(renderer, window)]
     }
 }
 
-impl<'a, Message, Theme, Renderer>
-    From<SelectableText<'a, Message, Theme, Renderer>>
+impl<'a, Message, Theme, Renderer> From<SelectableText<'a, Message, Theme>>
     for Element<'a, Message, Theme, Renderer>
 where
     Message: 'a,
     Theme: Catalog + context_menu::Catalog + 'a,
     Renderer: text::Renderer + 'a,
 {
-    fn from(text: SelectableText<'a, Message, Theme, Renderer>) -> Self {
-        Element::new(text)
+    fn from(text: SelectableText<'a, Message, Theme>) -> Self {
+        <SelectableText<'a, Message, Theme> as Widget<
+            Message,
+            Theme,
+            Renderer,
+        >>::_boxed(text)
     }
 }
 
@@ -624,7 +688,7 @@ impl Catalog for iced_widget::Theme {
 
 /// The default style of a [`SelectableText`].
 pub fn default(theme: &iced_widget::Theme) -> Style {
-    let palette = theme.extended_palette();
+    let palette = theme.palette();
 
     Style {
         color: palette.background.base.text,
