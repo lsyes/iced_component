@@ -3,14 +3,19 @@
 //! This crate currently provides:
 //!
 //! - [`context_menu`]: a reusable right-click menu that can be attached to any
-//!   other widget—usable on its own.
+//!   other widget—usable on its own. [`context_menu::app`] is an
+//!   application-managed variant for menus whose entries are described by
+//!   labels.
 //! - [`text_input::ContextMenuTextInput`]: a text input with a right-click
 //!   context menu (Cut / Copy / Paste / Select All).
 //! - [`selectable_text::SelectableText`]: text that can be selected with the
 //!   mouse or the keyboard and copied through the same context menu.
+//! - [`context_menu::native`]: application-owned handles that show the text
+//!   menus as native Wayland `xdg_popup`s.
 //!
-//! All of them are built entirely on top of the public `iced` APIs, so they can
-//! be dropped into any `iced` application without forking the framework.
+//! All of them are built on top of the public `iced` APIs. The optional native
+//! popup adds one narrowly scoped `winit` patch; see the crate's `README` for
+//! the `[patch]` section an application has to apply when enabling it.
 //!
 //! # Quick start
 //!

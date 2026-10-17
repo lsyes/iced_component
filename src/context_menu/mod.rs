@@ -35,12 +35,25 @@
 //! to the widget through [`Menu::on_dispatch`].
 //!
 //! [`Widget::overlay`]: iced_core::Widget::overlay
+//!
+//! # An application-managed menu
+//!
+//! [`app`] contains a second flavour of the same menu, ported from
+//! `iced_systemmonitor`. It is described by a list of labels and reports the
+//! index of the chosen entry, so it can be kept in the application state and
+//! reused for many widgets at once. It is drawn by layers of the root stack
+//! instead of an overlay—or, on Wayland with the `native` feature, by a real
+//! compositor popup.
 
 use std::borrow::Cow;
+
+pub mod app;
+pub mod native;
 
 use iced_core::keyboard;
 use iced_core::mouse;
 use iced_core::text;
+use iced_core::touch;
 use iced_core::widget::tree::{self, Tree};
 use iced_core::window;
 use iced_core::{
@@ -48,6 +61,24 @@ use iced_core::{
     Point, Rectangle, Shadow, Shell, Size, Vector, Widget, alignment, layout,
     overlay, renderer,
 };
+
+/// The raw pointer position carried by an event, in window coordinates.
+///
+/// Ancestors like a [`Scrollable`](iced_widget::Scrollable) translate the
+/// cursor into their content space before handing it to their children, while
+/// the event itself keeps reporting window coordinates. Widgets that draw a
+/// menu outside of their own coordinate space—like a native popup—use this
+/// position instead of the translated cursor.
+pub(crate) fn pointer_position(event: &Event) -> Option<Point> {
+    match event {
+        Event::Mouse(mouse::Event::CursorMoved { position }) => Some(*position),
+        Event::Touch(
+            touch::Event::FingerPressed { position, .. }
+            | touch::Event::FingerMoved { position, .. },
+        ) => Some(*position),
+        _ => None,
+    }
+}
 
 /// The spacing between the border of a menu and its entries.
 pub const PADDING: f32 = 6.0;

@@ -7,9 +7,40 @@ license = "MIT"
 repository = "https://github.com/lsyes/iced_component"
 keywords = ["gui", "widgets", "iced"]
 
+[features]
+default = []
+# Enables the native Wayland `xdg_popup` backend of `context_menu::app`.
+#
+# The popup needs the `xdg_surface` of the window, which winit only exposes
+# through the vendored patch below. Applications that enable this feature must
+# apply the same `[patch]` section to their own `Cargo.toml`.
+native = [
+    "dep:cosmic-text",
+    "dep:futures-timer",
+    "dep:libc",
+    "dep:log",
+    "dep:wayland-client",
+    "dep:wayland-protocols",
+    "dep:winit",
+]
+
 [dependencies]
+futures-timer = { version = "3", optional = true }
 iced_core = { git = "https://github.com/iced-rs/iced", branch = "master" }
+iced_futures = { git = "https://github.com/iced-rs/iced", branch = "master" }
 iced_widget = { git = "https://github.com/iced-rs/iced", branch = "master" }
+log = { version = "0.4", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cosmic-text = { git = "https://github.com/hecrj/cosmic-text.git", rev = "19cca2bd90e73e20614964f06d44240e71e503b3", optional = true }
+libc = { version = "0.2", optional = true }
+wayland-client = { version = "0.31", features = ["dlopen"], optional = true }
+wayland-protocols = { version = "0.32", features = ["client"], optional = true }
+winit = { git = "https://github.com/iced-rs/winit.git", rev = "48116469f15d3bc52b5e56bb516694be8882870d", default-features = false, features = [
+    "rwh_06",
+    "wayland",
+    "wayland-dlopen",
+], optional = true }
 
 [dev-dependencies]
 iced = { git = "https://github.com/iced-rs/iced", branch = "master", default-features = false, features = [
@@ -23,3 +54,12 @@ iced_test = { git = "https://github.com/iced-rs/iced", branch = "master" }
 iced_tiny_skia = { git = "https://github.com/iced-rs/iced", branch = "master" }
 tiny-skia = "0.11"
 bytemuck = "1"
+
+# The vendored winit exposes the `xdg_surface` of a window so that a native
+# `xdg_popup` context menu can be parented to it.
+#
+# Keep this revision and the vendored source in sync with the `winit` revision
+# required by the `iced` branch above.
+[patch."https://github.com/iced-rs/winit.git"]
+winit = { path = "third_party/winit" }
+dpi = { path = "third_party/winit/dpi" }

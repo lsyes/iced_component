@@ -29,6 +29,17 @@
 //! [`Clipboard`] the runtime exposes through the [`Shell`], via
 //! [`Editor::copy`].
 //!
+//! # Native menus
+//!
+//! On Linux with the `native` feature, pass an application-owned
+//! [`context_menu::native::Menu`] with
+//! [`native_menu`](SelectableText::native_menu) to draw the menu as a native
+//! Wayland `xdg_popup`. Keep one menu per text widget, feed it the window
+//! handle and window size, and forward
+//! [`context_menu::native::Event`]s to it.
+//! Without a handle—or without the feature—the widget keeps using its overlay
+//! menu.
+//!
 //! [`Editor`]: iced_core::text::editor::Editor
 //! [`Editor::copy`]: iced_core::text::editor::Editor::copy
 //! [`Clipboard`]: iced_core::clipboard
@@ -48,6 +59,7 @@ use iced_core::{
     Rectangle, Shell, Size, Vector, Widget, layout, overlay, renderer,
 };
 
+use crate::context_menu::native::Menu as NativeMenu;
 use crate::context_menu::{self, Entry, Menu};
 
 /// Text that can be selected with the mouse and copied to the clipboard.
@@ -69,6 +81,7 @@ where
     context_menu: bool,
     class: <Theme as Catalog>::Class<'a>,
     menu_class: Option<<Theme as context_menu::Catalog>::Class<'a>>,
+    native_menu: Option<NativeMenu>,
 }
 
 impl<'a, Message, Theme> SelectableText<'a, Message, Theme>
@@ -95,6 +108,7 @@ where
             context_menu: true,
             class: <Theme as Catalog>::default(),
             menu_class: None,
+            native_menu: None,
         }
     }
 
@@ -199,6 +213,20 @@ where
         self
     }
 
+    /// Uses a native Wayland popup for the context menu when possible.
+    ///
+    /// Keep one [`Menu`](crate::context_menu::native::Menu) per text widget in
+    /// the application state, feed it the window handle with
+    /// [`set_window_handle`](crate::context_menu::native::Menu::set_window_handle),
+    /// and forward [`Event`](crate::context_menu::native::Event)s to
+    /// [`update`](crate::context_menu::native::Menu::update). If no handle is
+    /// available—or the `native` feature is disabled—the widget falls back to
+    /// its in-application menu.
+    pub fn native_menu(mut self, menu: &NativeMenu) -> Self {
+        self.native_menu = Some(menu.clone());
+        self
+    }
+
     fn resolve_style(&self, theme: &Theme) -> Style {
         <Theme as Catalog>::style(theme, &self.class)
     }
@@ -223,6 +251,8 @@ struct State<E: iced_core::text::editor::Editor> {
     last_click: Option<mouse::Click>,
     keyboard_modifiers: keyboard::Modifiers,
     menu: context_menu::State,
+    /// The last pointer position in window coordinates.
+    pointer_position: Option<Point>,
 }
 
 impl<E: iced_core::text::editor::Editor> Default for State<E> {
@@ -235,6 +265,7 @@ impl<E: iced_core::text::editor::Editor> Default for State<E> {
             last_click: None,
             keyboard_modifiers: keyboard::Modifiers::default(),
             menu: context_menu::State::new(),
+            pointer_position: None,
         }
     }
 }
@@ -424,6 +455,31 @@ where
         let bounds = layout.bounds();
         let text_bounds = bounds.shrink(self.padding);
 
+        if let Some(position) = crate::context_menu::pointer_position(event) {
+            state.pointer_position = Some(position);
+        }
+
+        if let Some(native) = &self.native_menu
+            && let Some(index) = native.take_selection()
+        {
+            match index {
+                0 => {
+                    if let Some(selection) = state.editor.copy() {
+                        shell.write_clipboard(clipboard::Content::Text(
+                            selection,
+                        ));
+                    }
+                }
+                1 => {
+                    state.is_focused = true;
+                    state.editor.perform(Action::SelectAll);
+
+                    shell.request_redraw();
+                }
+                _ => {}
+            }
+        }
+
         // A right-click opens the context menu, whose entries are enabled
         // according to the current selection.
         if self.context_menu
@@ -432,10 +488,33 @@ where
             )) = event
             && let Some(position) = cursor.observe().position_over(bounds)
         {
+            let copy_enabled = state.editor.copy().is_some();
+            let select_all_enabled = !state.editor.is_empty();
+
             self.entries = vec![
-                Entry::dispatch("Copy").enabled(state.editor.copy().is_some()),
-                Entry::dispatch("Select All").enabled(!state.editor.is_empty()),
+                Entry::dispatch("Copy").enabled(copy_enabled),
+                Entry::dispatch("Select All").enabled(select_all_enabled),
             ];
+
+            if let Some(native) = &self.native_menu
+                && native.open(
+                    state.pointer_position.unwrap_or(position),
+                    [
+                        (String::from("Copy"), copy_enabled),
+                        (String::from("Select All"), select_all_enabled),
+                    ],
+                )
+            {
+                state.menu.close();
+
+                // Start the application's pump subscription right away.
+                shell.invalidate_widgets();
+
+                shell.capture_event();
+                shell.request_redraw();
+
+                return;
+            }
 
             state.menu.open(position);
 
@@ -693,5 +772,71 @@ pub fn default(theme: &iced_widget::Theme) -> Style {
     Style {
         color: palette.background.base.text,
         selection: palette.primary.weak.color,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_test::core::{Event, Point, Settings, Size, event, mouse};
+    use iced_test::simulator::Simulator;
+    use iced_widget::core::{Length, Vector};
+    use iced_widget::{Renderer, Theme, Widget, container, float};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Message {}
+
+    fn translated_view(
+        menu: &NativeMenu,
+    ) -> iced_test::core::Element<'static, Message, Theme, Renderer> {
+        let text = selectable_text("hello")
+            .width(Length::Fill)
+            .native_menu(menu);
+
+        let card = container(text)
+            .width(Length::Fixed(200.0))
+            .height(Length::Fixed(100.0));
+
+        float(card)
+            .translate(|_bounds, _viewport| Vector::new(40.0, 40.0))
+            .boxed()
+    }
+
+    #[test]
+    fn a_native_menu_opens_at_the_window_position() {
+        let menu = NativeMenu::new();
+        menu.enable_probe();
+
+        let mut ui = Simulator::with_size(
+            Settings::default(),
+            Size::new(400.0, 200.0),
+            translated_view(&menu),
+        );
+
+        // The float translates the cursor before the widget sees it; the native
+        // popup still has to open at the pointer in window coordinates.
+        let window_position = Point::new(140.0, 50.0);
+
+        ui.point_at(window_position);
+        let statuses = ui.simulate([
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: window_position,
+            }),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+        ]);
+
+        assert_eq!(statuses[1], event::Status::Captured);
+
+        let (position, items) =
+            menu.probed_open().expect("the native menu should open");
+
+        assert_eq!(position, window_position);
+        assert_eq!(
+            items,
+            vec![
+                (String::from("Copy"), false),
+                (String::from("Select All"), true),
+            ]
+        );
     }
 }

@@ -45,6 +45,17 @@
 //!    the action reuses iced's own editing and clipboard plumbing—including the
 //!    `on_input` / `on_paste` messages—rather than duplicating it.
 //!
+//! # Native menus
+//!
+//! On Linux with the `native` feature, pass an application-owned
+//! [`context_menu::native::Menu`] with
+//! [`native_menu`](ContextMenuTextInput::native_menu) to draw the menu as a
+//! native Wayland `xdg_popup`. Keep one menu per input, feed it the window
+//! handle and window size, and forward
+//! [`context_menu::native::Event`]s to it.
+//! Without a handle—or without the feature—the input keeps using its overlay
+//! menu.
+//!
 //! [`TextInput`]: iced_widget::text_input::TextInput
 //! [`Editor`]: iced_core::text::Editor
 //! [`Binding`]: iced_core::text::editor::Binding
@@ -59,11 +70,12 @@ use iced_core::widget::operation::Focusable as _;
 use iced_core::widget::tree::{self, Tree};
 use iced_core::window;
 use iced_core::{
-    Element, Event, Font, Layout, Length, Padding, Pixels, Rectangle, Shell,
-    Size, Vector, Widget, renderer,
+    Element, Event, Font, Layout, Length, Padding, Pixels, Point, Rectangle,
+    Shell, Size, Vector, Widget, renderer,
 };
 use iced_widget::text_input::{self, Status, Style};
 
+use crate::context_menu::native::Menu as NativeMenu;
 use crate::context_menu::{self, Entry, Menu};
 
 /// The default [`Padding`] of a [`ContextMenuTextInput`].
@@ -97,6 +109,7 @@ where
     alignment: text::Alignment,
     class: <Theme as text_input::Catalog>::Class<'a>,
     menu_class: Option<<Theme as context_menu::Catalog>::Class<'a>>,
+    native_menu: Option<NativeMenu>,
     last_status: Option<Status>,
 }
 
@@ -130,6 +143,7 @@ where
             alignment: text::Alignment::Default,
             class: <Theme as text_input::Catalog>::default(),
             menu_class: None,
+            native_menu: None,
             last_status: None,
         }
     }
@@ -272,6 +286,20 @@ where
             Some((Box::new(style) as context_menu::StyleFn<'a, Theme>).into());
         self
     }
+
+    /// Uses a native Wayland popup for the context menu when possible.
+    ///
+    /// Keep one [`Menu`](crate::context_menu::native::Menu) per input in the
+    /// application state, feed it the window handle with
+    /// [`set_window_handle`](crate::context_menu::native::Menu::set_window_handle),
+    /// and forward [`Event`](crate::context_menu::native::Event)s to
+    /// [`update`](crate::context_menu::native::Menu::update). If no handle is
+    /// available—or the `native` feature is disabled—the input falls back to
+    /// its in-application menu.
+    pub fn native_menu(mut self, menu: &NativeMenu) -> Self {
+        self.native_menu = Some(menu.clone());
+        self
+    }
 }
 
 /// Creates a new [`ContextMenuTextInput`].
@@ -291,6 +319,8 @@ struct State<R: text::Renderer> {
     input: text::Input<R>,
     value: String,
     menu: context_menu::State,
+    /// The last pointer position in window coordinates.
+    pointer_position: Option<Point>,
 }
 
 impl<R: text::Renderer> Default for State<R> {
@@ -299,6 +329,7 @@ impl<R: text::Renderer> Default for State<R> {
             input: text::Input::new(),
             value: String::new(),
             menu: context_menu::State::new(),
+            pointer_position: None,
         }
     }
 }
@@ -392,6 +423,16 @@ where
         let state = tree.state.downcast_mut::<State<Renderer>>();
         let bounds = layout.bounds();
 
+        if let Some(position) = crate::context_menu::pointer_position(event) {
+            state.pointer_position = Some(position);
+        }
+
+        if let Some(native) = &self.native_menu
+            && let Some(index) = native.take_selection()
+        {
+            perform_native_selection(self, index, state, bounds, shell);
+        }
+
         // A right-click opens the menu. On an unfocused input, replaying it as
         // a left click makes the engine focus itself and drop the caret right
         // where the user clicked, without this wrapper having to know anything
@@ -419,14 +460,38 @@ where
                 }
             }
 
+            let mut items: Vec<(String, bool)> =
+                Vec::with_capacity(Action::ALL.len());
+
             self.entries = Action::ALL
                 .iter()
                 .map(|action| {
-                    Entry::dispatch(action.label()).enabled(
-                        action.is_enabled(&state.value, self.is_secure),
-                    )
+                    let enabled =
+                        action.is_enabled(&state.value, self.is_secure);
+
+                    items.push((action.label().to_string(), enabled));
+
+                    Entry::dispatch(action.label()).enabled(enabled)
                 })
                 .collect();
+
+            if let Some(native) = &self.native_menu
+                && native
+                    .open(state.pointer_position.unwrap_or(position), items)
+            {
+                state.menu.close();
+
+                // The native popup is pumped by an application subscription
+                // that only exists while the menu is open. Invalidate the
+                // widgets so the runtime re-evaluates the subscriptions right
+                // away, without asking the application for a dummy message.
+                shell.invalidate_widgets();
+
+                shell.capture_event();
+                shell.request_redraw();
+
+                return;
+            }
 
             state.menu.open(position);
 
@@ -566,7 +631,9 @@ where
 
         let bounds = layout.bounds();
 
-        let State { input, value, menu } = state;
+        let State {
+            input, value, menu, ..
+        } = state;
 
         let on_input = self.on_input.as_ref();
         let on_paste = self.on_paste.as_ref();
@@ -609,6 +676,44 @@ where
 
         vec![menu.overlay(renderer, window)]
     }
+}
+
+/// Applies an entry chosen in the native popup.
+fn perform_native_selection<Message, Theme, Renderer>(
+    input: &ContextMenuTextInput<'_, Message, Theme>,
+    index: usize,
+    state: &mut State<Renderer>,
+    bounds: Rectangle,
+    shell: &mut Shell<'_, Message>,
+) where
+    Message: Clone,
+    Theme: text_input::Catalog + context_menu::Catalog,
+    Renderer: text::Renderer,
+{
+    let Some(action) = Action::ALL.get(index).copied() else {
+        return;
+    };
+
+    let Some(edit) = action.dispatch(&mut state.input, bounds, shell) else {
+        return;
+    };
+
+    let Some(on_input) = &input.on_input else {
+        return;
+    };
+
+    let on_input = if let Some(on_paste) = &input.on_paste
+        && edit.has_pasted
+    {
+        on_paste
+    } else {
+        on_input
+    };
+
+    state.value = state.input.value();
+
+    shell.publish(on_input(state.value.clone()));
+    shell.request_redraw();
 }
 
 impl<'a, Message, Theme, Renderer>
@@ -699,5 +804,106 @@ impl Action {
             Action::Paste => true,
             Action::SelectAll => !value.is_empty(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_test::core::window;
+    use iced_test::core::{Event, Point, Settings, Size, event, mouse};
+    use iced_test::simulator::{self, Simulator};
+    use iced_widget::core::{Length, Vector};
+    use iced_widget::{Renderer, Theme, Widget, container, float};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Message {
+        Changed(String),
+    }
+
+    fn view(
+        menu: &NativeMenu,
+    ) -> iced_test::core::Element<'static, Message, Theme, Renderer> {
+        context_menu_text_input("", "hello")
+            .on_input(Message::Changed)
+            .native_menu(menu)
+            .into()
+    }
+
+    fn translated_view(
+        menu: &NativeMenu,
+    ) -> iced_test::core::Element<'static, Message, Theme, Renderer> {
+        let input = context_menu_text_input("", "hello")
+            .on_input(Message::Changed)
+            .native_menu(menu);
+
+        let card = container(input)
+            .width(Length::Fixed(200.0))
+            .height(Length::Fixed(100.0));
+
+        float(card)
+            .translate(|_bounds, _viewport| Vector::new(40.0, 40.0))
+            .boxed()
+    }
+
+    #[test]
+    fn a_native_menu_opens_at_the_window_position() {
+        let menu = NativeMenu::new();
+        menu.enable_probe();
+
+        let mut ui = Simulator::with_size(
+            Settings::default(),
+            Size::new(400.0, 200.0),
+            translated_view(&menu),
+        );
+
+        // The cursor is translated by the float before the input sees it; the
+        // native popup, however, has to open in window coordinates.
+        let window_position = Point::new(140.0, 50.0);
+
+        ui.point_at(window_position);
+        let statuses = ui.simulate([
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: window_position,
+            }),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+        ]);
+
+        assert_eq!(statuses[1], event::Status::Captured);
+
+        let (position, items) =
+            menu.probed_open().expect("the native menu should open");
+
+        assert_eq!(position, window_position);
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().all(|(_, enabled)| *enabled));
+    }
+
+    #[test]
+    fn a_native_selection_is_applied_on_the_next_update() {
+        let menu = NativeMenu::new();
+        let mut ui = Simulator::with_size(
+            Settings::default(),
+            Size::new(400.0, 200.0),
+            view(&menu),
+        );
+
+        // Focus the input so the editor accepts the synthetic bindings.
+        ui.point_at(Point::new(10.0, 10.0));
+        let _ = ui.simulate(simulator::click());
+
+        // "Select All" (index 3), then "Cut" (index 0). The native popup
+        // would normally leave these selections in the shared menu handle.
+        for index in [3, 0] {
+            menu.set_selection(index);
+
+            let _ = ui.simulate([Event::Window(
+                window::Event::RedrawRequested(std::time::Instant::now()),
+            )]);
+        }
+
+        let messages: Vec<Message> = ui.into_messages().collect();
+
+        assert_eq!(messages, vec![Message::Changed(String::new())]);
     }
 }
